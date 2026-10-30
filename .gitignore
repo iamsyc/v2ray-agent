@@ -14,3 +14,7 @@ test
 checks/*
 !checks/socks5_standalone_test.py
 !checks/test_socks5_outbound.py
+!checks/test_onepanel_backend.py
+!checks/onepanel_e2e.py
+__pycache__/
+*.pyc

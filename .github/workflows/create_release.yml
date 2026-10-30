@@ -11,6 +11,7 @@ permissions:
 
 jobs:
   check-release:
+    if: github.repository == 'mack-a/v2ray-agent'
     runs-on: ubuntu-latest
 
     steps:

@@ -4,6 +4,68 @@
 # 检查系统
 export LANG=en_US.UTF-8
 
+# The standalone path does not load or download any 1Panel components.
+webBackend=standalone
+onepanelBackendSHA256='1076b97a9380c1ec59bfd669bb24848d14d5b92f5f5cc675efca70a320d805dd'
+onepanelControllerSHA256='0daf563fc7a6272adacb996f0cd575aad60db44b980a6cac6fee046feb2b4ba5'
+onepanelInstallerDirectory=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+onepanelInstallerFile="${onepanelInstallerDirectory}/$(basename -- "${BASH_SOURCE[0]}")"
+
+onepanelLoadModule() {
+    local destination=/etc/v2ray-agent/onepanel staging file expected candidate found
+    command -v python3 >/dev/null || { echo '1Panel 模式需要 python3，请先安装'; return 1; }
+    mkdir -p "${destination}" || return 1
+    staging=$(mktemp -d "${destination}/.download.XXXXXX") || return 1
+    for file in backend.sh controller.py; do
+        expected=${onepanelBackendSHA256}
+        [[ "${file}" != controller.py ]] || expected=${onepanelControllerSHA256}
+        found=false
+        for candidate in "${onepanelInstallerDirectory}/onepanel/${file}" "${destination}/${file}"; do
+            if [[ -f "${candidate}" && "$(sha256sum "${candidate}" | awk '{print $1}')" == "${expected}" ]]; then
+                cp "${candidate}" "${staging}/${file}" || { rm -rf "${staging}"; return 1; }
+                found=true
+                break
+            fi
+        done
+        if [[ "${found}" == false ]]; then
+            if ! curl -fsSL --connect-timeout 15 --max-time 90 \
+                "https://raw.githubusercontent.com/iamsyc/v2ray-agent/master/onepanel/${file}" -o "${staging}/${file}"; then
+                rm -rf "${staging}"; return 1
+            fi
+        fi
+        if [[ "$(sha256sum "${staging}/${file}" | awk '{print $1}')" != "${expected}" ]]; then
+            echo '1Panel 模块校验失败，未执行下载的代码'
+            rm -rf "${staging}"; return 1
+        fi
+    done
+    bash -n "${staging}/backend.sh" || { rm -rf "${staging}"; return 1; }
+    for file in backend.sh controller.py; do
+        chmod 600 "${staging}/${file}" && mv -f "${staging}/${file}" "${destination}/${file}" || { rm -rf "${staging}"; return 1; }
+    done
+    rm -rf "${staging}"
+    source "${destination}/backend.sh"
+}
+
+selectWebBackend() {
+    local choice default=1
+    [[ "${webBackend}" != onepanel ]] || default=2
+    echoContent yellow 'Web 服务模式：1.独立 Nginx（原版）  2.1Panel OpenResty（复用网站和证书）'
+    read -r -p "请选择 [回车 ${default}]:" choice
+    choice=${choice:-${default}}
+    case "${choice}" in
+    1)
+        [[ ! -f /etc/v2ray-agent/onepanel.json ]] || {
+            echoContent red '已有 1Panel 安装，不能直接覆盖为独立 Nginx；请先卸载代理并处理面板的端口占用。'; return 1;
+        }
+        webBackend=standalone ;;
+    2)
+        [[ "${EUID}" == 0 ]] || { echoContent red '1Panel 模式请使用 root 运行'; return 1; }
+        onepanelLoadModule || return 1
+        webBackend=onepanel ;;
+    *) return 1 ;;
+    esac
+}
+
 echoContent() {
     case $1 in
     # 红色
@@ -373,7 +435,7 @@ xraySelectionNeedsCertificate() {
 }
 
 isValidXHTTPTLSPort() {
-    [[ "${1:-}" =~ ^[0-9]+$ ]] && ((10#${1} >= 10000 && 10#${1} <= 30000))
+    [[ "${1:-}" =~ ^[0-9]{1,5}$ ]] && ((10#${1} >= 1 && 10#${1} <= 65535))
 }
 
 buildXrayXHTTPTLSConfig() {
@@ -593,6 +655,7 @@ readCustomPort() {
 
 # 读取nginx订阅端口
 readNginxSubscribe() {
+    if [[ "${webBackend:-}" == onepanel ]]; then onepanelReadSubscribe; return $?; fi
     subscribePort=
     subscribeType=https
     subscribeDomain=
@@ -1306,6 +1369,9 @@ cleanUp() {
     fi
 }
 initVar "$1"
+if [[ -f /etc/v2ray-agent/onepanel.json ]]; then
+    onepanelLoadModule && onepanelLoadState || exit 1
+fi
 checkSystem
 checkCPUVendor
 
@@ -1555,6 +1621,7 @@ bootStartup() {
 }
 # 安装Nginx
 installNginxTools() {
+    if [[ "${webBackend:-}" == onepanel ]]; then onepanelRunning; return $?; fi
 
     if [[ "${release}" == "debian" ]]; then
         sudo apt install gnupg2 ca-certificates lsb-release -y >/dev/null 2>&1
@@ -1827,6 +1894,7 @@ ensureNginxServerNamesHashBucketSize() {
 }
 # 修改nginx重定向配置
 updateRedirectNginxConf() {
+    if [[ "${webBackend:-}" == onepanel ]]; then onepanelController reload; return $?; fi
     ensureNginxServerNamesHashBucketSize
     local redirectDomain=
     redirectDomain=${domain}:${port}
@@ -2199,6 +2267,7 @@ acmeInstallSSL() {
 }
 # 自定义端口
 customPortFunction() {
+    if [[ "${webBackend:-}" == onepanel ]]; then port=$(onepanelReadPort 0); customPort=${port}; return 0; fi
     local historyCustomPortStatus=
     if [[ -n "${customPort}" || -n "${currentPort}" ]]; then
         echo
@@ -2399,6 +2468,7 @@ randomNum() {
 }
 # Nginx伪装博客
 nginxBlog() {
+    if [[ "${webBackend:-}" == onepanel ]]; then onepanelManagedWebsite; return 0; fi
     if [[ -n "$1" ]]; then
         echoContent skyBlue "\n进度 $1/${totalProgress} : 添加伪装站点"
     else
@@ -2470,6 +2540,7 @@ updateSELinuxHTTPPortT() {
 
 # 检查Nginx服务是否运行
 isNginxRunning() {
+    if [[ "${webBackend:-}" == onepanel ]]; then onepanelRunning; return $?; fi
     if [[ "${release}" == "alpine" ]]; then
         rc-service nginx status >/dev/null 2>&1
     else
@@ -2479,6 +2550,7 @@ isNginxRunning() {
 
 # 操作Nginx
 handleNginx() {
+    if [[ "${webBackend:-}" == onepanel ]]; then onepanelNginx "$@"; return $?; fi
     local -a nginxStart nginxStop nginxStatus
     if [[ "${release}" == "alpine" ]]; then
         nginxStart=(rc-service nginx start)
@@ -2533,6 +2605,7 @@ handleNginx() {
 
 # 定时任务更新tls证书
 installCronTLS() {
+    if [[ "${webBackend:-}" == onepanel ]]; then onepanelController watch; return $?; fi
     if [[ -z "${btDomain}" ]]; then
         echoContent skyBlue "\n进度 $1/${totalProgress} : 添加定时维护证书"
         crontab -l >/etc/v2ray-agent/backup_crontab.cron
@@ -2561,6 +2634,7 @@ installCronUpdateGeo() {
 
 # 更新证书
 renewalTLS() {
+    if [[ "${webBackend:-}" == onepanel ]]; then echoContent yellow "证书由 1Panel 自动续期，此处同步其当前证书"; onepanelController deploy; return $?; fi
     if [[ "${currentInstallProtocolType}" == ",20," ]]; then
         echoContent yellow " ---> 仅安装 SOCKS5 入站，请通过 Socks5 入站菜单管理配置"
         return 1
@@ -5036,6 +5110,9 @@ EOF
         addXrayOutbound z_direct_outbound
         addXrayOutbound blackhole_out
     fi
+    if [[ "${webBackend:-}" == onepanel ]]; then
+        onepanelController normalize || return 1
+    fi
 }
 
 # 初始化TCP Brutal
@@ -6535,6 +6612,7 @@ addNginx302() {
 
 # 更新伪装站
 updateNginxBlog() {
+    if [[ "${webBackend:-}" == onepanel ]]; then onepanelManagedWebsite; return 0; fi
     if [[ "${coreInstallType}" == "2" ]]; then
         echoContent red "\n ---> 此功能仅支持Xray-core内核"
         exit 0
@@ -6615,6 +6693,7 @@ updateNginxBlog() {
 
 # 添加新端口
 addCorePort() {
+    if [[ "${webBackend:-}" == onepanel ]]; then echoContent yellow "1Panel 模式请通过重新安装流程设置各协议端口，避免覆盖共享入口"; return 0; fi
 
     if [[ "${coreInstallType}" == "2" ]]; then
         echoContent red "\n ---> 此功能仅支持Xray-core内核"
@@ -6754,6 +6833,7 @@ EOF
 
 # 卸载脚本
 unInstall() {
+    if [[ "${webBackend:-}" == onepanel ]]; then onepanelUninstall; return $?; fi
     read -r -p "是否确认卸载安装内容？[y/n]:" unInstallStatus
     if [[ "${unInstallStatus}" != "y" ]]; then
         echoContent green " ---> 放弃卸载"
@@ -7280,7 +7360,7 @@ updateV2RayAgent() {
     echoContent skyBlue "\n进度  $1/${totalProgress} : 更新v2ray-agent脚本"
     local scriptTemp
     scriptTemp=$(mktemp /etc/v2ray-agent/.install.XXXXXX) || return 1
-    if ! wget -q -O "${scriptTemp}" "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/install.sh" ||
+    if ! wget -q -O "${scriptTemp}" "https://raw.githubusercontent.com/iamsyc/v2ray-agent/master/install.sh" ||
         [[ ! -s "${scriptTemp}" ]] || ! bash -n "${scriptTemp}"; then
         rm -f "${scriptTemp}"
         echoContent red " ---> 脚本下载或校验失败，保留当前版本"
@@ -7297,7 +7377,7 @@ updateV2RayAgent() {
     echoContent yellow " ---> 请手动执行[vasma]打开脚本"
     echoContent green " ---> 当前版本：${version}\n"
     echoContent yellow "如更新不成功，请手动执行下面命令\n"
-    echoContent skyBlue "wget -P /root -N --no-check-certificate https://raw.githubusercontent.com/mack-a/v2ray-agent/master/install.sh && chmod 700 /root/install.sh && /root/install.sh"
+    echoContent skyBlue "wget -P /root -N --no-check-certificate https://raw.githubusercontent.com/iamsyc/v2ray-agent/master/install.sh && chmod 700 /root/install.sh && /root/install.sh"
     echo
     exit 0
 }
@@ -10496,6 +10576,11 @@ selectCoreInstall() {
     read -r -p "请选择:" selectCoreType
     case ${selectCoreType} in
     1)
+        selectWebBackend || return 1
+        if [[ "${webBackend}" == onepanel ]]; then
+            onepanelInstall
+            return $?
+        fi
         if [[ "${selectInstallType}" == "1" ]]; then
             xrayCoreInstall
         elif [[ "${selectInstallType}" == "2" ]]; then
@@ -10505,6 +10590,10 @@ selectCoreInstall() {
         fi
         ;;
     2)
+        if [[ "${webBackend}" == onepanel ]]; then
+            echoContent red '1Panel 模式目前支持 Xray-core；请保留此安装模式或先卸载代理。'
+            return 1
+        fi
         if [[ "${selectInstallType}" == "1" ]]; then
             singBoxInstall
         elif [[ "${selectInstallType}" == "2" ]]; then
@@ -10730,6 +10819,7 @@ viewSubscriptionByUser() {
 
 # 安装订阅
 installSubscribe() {
+    if [[ "${webBackend:-}" == onepanel ]]; then onepanelRunning; return $?; fi
     readNginxSubscribe
     local nginxSubscribeListen=
     local nginxSubscribeSSL=
@@ -10825,6 +10915,7 @@ EOF
 }
 # 卸载订阅
 unInstallSubscribe() {
+    if [[ "${webBackend:-}" == onepanel ]]; then return 0; fi
     rm -rf ${nginxConfigPath}subscribe.conf >/dev/null 2>&1
 }
 
@@ -11669,6 +11760,7 @@ checkRealityDest() {
 
 # 初始化客户端可用的ServersName
 initRealityClientServersName() {
+    if [[ "${webBackend:-}" == onepanel ]]; then realityServerName=${onepanelDomain}; realityDomainPort=${onepanelWebPort}; return 0; fi
     local realityDestDomainList=
     if [[ "${coreInstallType}" == "1" || "${selectCoreType}" == "1" ]]; then
         realityDestDomainList="download-installer.cdn.mozilla.net,addons.mozilla.org,s0.awsstatic.com,d1.awsstatic.com,images-na.ssl-images-amazon.com,m.media-amazon.com,player.live-video.net,one-piece.com,lol.secure.dyn.riotcdn.net,www.lovelive-anime.jp,academy.nvidia.com,dl.google.com,www.google-analytics.com,www.caltech.edu,www.calstatela.edu,www.suny.edu,www.suffolk.edu,www.python.org,vuejs-jp.org,vuejs.org,zh-hk.vuejs.org,react.dev,www.java.com,www.oracle.com,www.mysql.com,www.mongodb.com,redis.io,cname.vercel-dns.com,vercel-dns.com,www.swift.com,academy.nvidia.com,www.swift.com,www.cisco.com,www.asus.com,www.samsung.com,www.amd.com,www.umcg.nl,www.fom-international.com,www.u-can.co.jp,github.io"
@@ -11747,6 +11839,7 @@ initRealityClientServersName() {
 }
 # 初始化reality端口
 initXrayRealityPort() {
+    if [[ "${webBackend:-}" == onepanel ]]; then realityPort=$(onepanelReadPort 7); return 0; fi
     if [[ -n "${xrayVLESSRealityPort}" && -z "${lastInstallationConfig}" ]]; then
         read -r -p "读取到上次安装记录，是否使用上次安装时的端口 ？[y/n]:" historyRealityPortStatus
         if [[ "${historyRealityPortStatus}" == "y" ]]; then
@@ -11787,6 +11880,7 @@ initXrayRealityPort() {
 }
 # 初始化XHTTP端口
 initXrayXHTTPort() {
+    if [[ "${webBackend:-}" == onepanel ]]; then xHTTPort=$(onepanelReadPort 12); return 0; fi
     if [[ -n "${xrayVLESSRealityXHTTPort}" && -z "${lastInstallationConfig}" ]]; then
         read -r -p "读取到上次安装记录，是否使用上次安装时的端口 ？[y/n]:" historyXHTTPortStatus
         if [[ "${historyXHTTPortStatus}" == "y" ]]; then
@@ -11820,6 +11914,7 @@ initXrayXHTTPort() {
 
 # 初始化 XHTTP TLS 公网 TCP 端口
 initXrayXHTTPTLSPort() {
+    if [[ "${webBackend:-}" == onepanel ]]; then xHTTPTLSPort=$(onepanelReadPort 14); return 0; fi
     xHTTPTLSPort=
     if [[ -n "${xrayVLESSXHTTPTLSPort}" && -z "${lastInstallationConfig}" ]]; then
         read -r -p "读取到上次安装记录，是否使用上次安装时的端口？[y/n]:" historyXHTTPTLSPortStatus
@@ -11935,6 +12030,7 @@ realityScanner() {
 }
 # hysteria管理
 manageHysteria() {
+    if [[ "${webBackend:-}" == onepanel ]]; then echoContent yellow "1Panel 后端目前管理 Xray 协议；Hysteria2/TUIC 请使用独立模式"; return 0; fi
     echoContent skyBlue "\n进度  1/1 : Hysteria2 管理"
     echoContent red "\n=============================================================="
     local hysteria2Status=
@@ -11962,6 +12058,7 @@ manageHysteria() {
 
 # tuic管理
 manageTuic() {
+    if [[ "${webBackend:-}" == onepanel ]]; then echoContent yellow "1Panel 后端目前管理 Xray 协议；Hysteria2/TUIC 请使用独立模式"; return 0; fi
     echoContent skyBlue "\n进度  1/1 : Tuic管理"
     echoContent red "\n=============================================================="
     local tuicStatus=

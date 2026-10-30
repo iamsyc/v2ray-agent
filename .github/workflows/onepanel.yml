@@ -1,0 +1,28 @@
+name: 1Panel backend checks
+on:
+  push:
+    branches: [master, feature/1panel-openresty]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y jq openssl shellcheck
+      - name: Syntax and asset integrity
+        run: |
+          bash -n install.sh
+          bash -n onepanel/backend.sh
+          python3 -m py_compile onepanel/controller.py
+          python3 tools/update_onepanel_manifest.py --check
+          shellcheck -S warning onepanel/backend.sh
+      - name: 1Panel contracts and certificate rotation
+        run: python3 -m unittest discover -s checks -p 'test_onepanel_backend.py' -v
+      - name: Existing standalone SOCKS5 regressions
+        run: |
+          python3 checks/socks5_standalone_test.py
+          python3 checks/test_socks5_outbound.py
