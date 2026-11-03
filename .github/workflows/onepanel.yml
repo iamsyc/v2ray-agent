@@ -16,12 +16,15 @@ jobs:
       - name: Syntax and asset integrity
         run: |
           bash -n install.sh
+          bash -n shell/install_en.sh
           bash -n onepanel/backend.sh
           python3 -m py_compile onepanel/controller.py
           python3 tools/update_onepanel_manifest.py --check
           shellcheck -S warning onepanel/backend.sh
       - name: 1Panel contracts and certificate rotation
         run: python3 -m unittest discover -s checks -p 'test_onepanel_backend.py' -v
+      - name: Upstream Hysteria2 account regressions
+        run: python3 checks/test_upstream_sync.py
       - name: Existing standalone SOCKS5 regressions
         run: |
           python3 checks/socks5_standalone_test.py

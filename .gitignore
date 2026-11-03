@@ -18,3 +18,5 @@ checks/*
 !checks/onepanel_e2e.py
 __pycache__/
 *.pyc
+
+!checks/test_upstream_sync.py

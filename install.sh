@@ -242,6 +242,7 @@ initVar() {
     singBoxVLESSRealityVisionPort=
     singBoxVLESSRealityGRPCPort=
     singBoxHysteria2Port=
+    xrayHysteria2Port=
     singBoxTrojanPort=
     singBoxTuicPort=
     singBoxNaivePort=
@@ -411,7 +412,7 @@ normalizeXrayInstallSelection() {
         case "${token}" in
         0) has_zero=true ;;
         1 | 2 | 3 | 4 | 5) has_legacy=true ;;
-        7 | 12 | 14) ;;
+        6 | 7 | 12 | 14) ;;
         esac
         normalized+="${token},"
     done
@@ -431,7 +432,7 @@ xraySelectionNeedsCustomPort() {
 }
 
 xraySelectionNeedsCertificate() {
-    [[ "${1:-}" =~ ,(0|1|2|3|4|5|11|13|14), ]]
+    [[ "${1:-}" =~ ,(0|1|2|3|4|5|6|11|13|14), ]]
 }
 
 isValidXHTTPTLSPort() {
@@ -553,6 +554,8 @@ deleteXrayUserByUUID() {
               .inbounds |= map(
                 if (.settings.clients? | type) == "array" then
                   .settings.clients |= map(select((.id? != $uuid) and (.password? != $uuid)))
+                elif (.settings.users? | type) == "array" then
+                  .settings.users |= map(select(.auth? != $uuid))
                 elif .type == "hysteria2" and (.users? | type) == "array" then
                   .users |= map(select(.password? != $uuid))
                 elif .type == "tuic" and (.users? | type) == "array" then
@@ -612,8 +615,9 @@ getXrayAccountReferenceConfig() {
         "${configPath}${frontingType:-}.json" \
         "${configPath}${frontingTypeReality:-}.json" \
         "${configPath}14_VLESS_XHTTP_TLS_inbounds.json" \
-        "${configPath}12_VLESS_XHTTP_inbounds.json"; do
-        if [[ -f "${candidate}" ]] && jq -e '(.inbounds[0].settings.clients // .inbounds[1].settings.clients) | type == "array"' "${candidate}" >/dev/null 2>&1; then
+        "${configPath}12_VLESS_XHTTP_inbounds.json" \
+        "${configPath}06_hysteria2_inbounds.json"; do
+        if [[ -f "${candidate}" ]] && jq -e '(.inbounds[0].settings.clients // .inbounds[1].settings.clients // .inbounds[0].settings.users) | type == "array"' "${candidate}" >/dev/null 2>&1; then
             printf '%s\n' "${candidate}"
             return 0
         fi
@@ -644,7 +648,8 @@ readAcmeTLS() {
 
 # 读取默认自定义端口
 readCustomPort() {
-    if [[ -n "${configPath}" && -z "${realityStatus}" && "${coreInstallType}" == "1" ]]; then
+    if [[ -n "${configPath}" && -n "${frontingType}" && -z "${realityStatus}" && "${coreInstallType}" == "1" ]] &&
+        [[ -f "${configPath}${frontingType}.json" ]]; then
         local port=
         port=$(jq -r .inbounds[0].port "${configPath}${frontingType}.json")
         if [[ "${port}" != "443" ]]; then
@@ -684,7 +689,7 @@ readInstallType() {
     if [[ -d "/etc/v2ray-agent" ]]; then
         if [[ -f "/etc/v2ray-agent/xray/xray" ]]; then
             # 检测xray-core
-            if [[ -d "/etc/v2ray-agent/xray/conf" ]] && [[ -f "/etc/v2ray-agent/xray/conf/02_VLESS_TCP_inbounds.json" || -f "/etc/v2ray-agent/xray/conf/02_trojan_TCP_inbounds.json" || -f "/etc/v2ray-agent/xray/conf/07_VLESS_vision_reality_inbounds.json" || -f "/etc/v2ray-agent/xray/conf/12_VLESS_XHTTP_inbounds.json" || -f "/etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json" ]]; then
+            if [[ -d "/etc/v2ray-agent/xray/conf" ]] && [[ -f "/etc/v2ray-agent/xray/conf/02_VLESS_TCP_inbounds.json" || -f "/etc/v2ray-agent/xray/conf/02_trojan_TCP_inbounds.json" || -f "/etc/v2ray-agent/xray/conf/06_hysteria2_inbounds.json" || -f "/etc/v2ray-agent/xray/conf/07_VLESS_vision_reality_inbounds.json" || -f "/etc/v2ray-agent/xray/conf/12_VLESS_XHTTP_inbounds.json" || -f "/etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json" ]]; then
                 # xray-core
                 configPath=/etc/v2ray-agent/xray/conf/
                 ctlPath=/etc/v2ray-agent/xray/xray
@@ -723,6 +728,7 @@ readInstallProtocolType() {
     xrayVLESSRealityPort=
     xrayVLESSRealityVisionPort=
     xrayVLESSRealityServerName=
+    xrayHysteria2Port=
 
     xrayVLESSRealityXHTTPort=
     xrayVLESSRealityXHTTPServerName=
@@ -815,7 +821,9 @@ readInstallProtocolType() {
         fi
         if echo "${row}" | grep -q hysteria2_inbounds; then
             currentInstallProtocolType="${currentInstallProtocolType}6,"
-            if [[ "${coreInstallType}" == "2" ]]; then
+            if [[ "${coreInstallType}" == "1" ]]; then
+                xrayHysteria2Port=$(jq -r '.inbounds[0].port' "${row}.json")
+            elif [[ "${coreInstallType}" == "2" ]]; then
                 frontingType=06_hysteria2_inbounds
                 singBoxHysteria2Port=$(jq .inbounds[0].listen_port "${row}.json")
             fi
@@ -1101,6 +1109,13 @@ readSingBoxConfig() {
             hysteria2ClientDownloadSpeed=$(jq -r '.inbounds[0].up_mbps' "${singBoxConfigPath}06_hysteria2_inbounds.json")
         fi
     fi
+    if [[ "${coreInstallType}" == "1" && -f "${configPath}06_hysteria2_inbounds.json" ]]; then
+        hysteriaPort=$(jq -r '.inbounds[0].port' "${configPath}06_hysteria2_inbounds.json")
+    fi
+    if [[ -n "${hysteriaPort}" ]]; then
+        [[ "${hysteria2ClientUploadSpeed}" =~ ^[0-9]+([.][0-9]+)?$ ]] || hysteria2ClientUploadSpeed=50
+        [[ "${hysteria2ClientDownloadSpeed}" =~ ^[0-9]+([.][0-9]+)?$ ]] || hysteria2ClientDownloadSpeed=100
+    fi
 }
 
 # 读取上次安装的配置
@@ -1176,6 +1191,18 @@ readConfigHostPathUUID() {
             fi
             currentUUID=$(jq -r .inbounds[0].settings.clients[0].id ${configPath}${frontingType}.json)
             currentClients=$(jq -r .inbounds[0].settings.clients ${configPath}${frontingType}.json)
+        fi
+
+        if [[ -z "${frontingType}" && -f "${configPath}06_hysteria2_inbounds.json" ]] && echo "${currentInstallProtocolType}" | grep -q ",6,"; then
+            local hysteriaConfig="${configPath}06_hysteria2_inbounds.json"
+            currentHost=$(jq -r '.inbounds[0].streamSettings.tlsSettings.serverName // empty' "${hysteriaConfig}")
+            if [[ -z "${currentHost}" ]]; then
+                currentHost=$(jq -r '.inbounds[0].streamSettings.tlsSettings.certificates[0].certificateFile // empty' "${hysteriaConfig}" | sed -E 's#^.*/##; s#\.crt$##')
+            fi
+            currentPort=$(jq -r '.inbounds[0].port' "${hysteriaConfig}")
+            currentDefaultPort=${currentPort}
+            currentUUID=$(jq -r '.inbounds[0].settings.users[0].auth // empty' "${hysteriaConfig}")
+            currentClients=$(jq -c '.inbounds[0].settings.users // []' "${hysteriaConfig}")
         fi
 
         # reality
@@ -2838,7 +2865,16 @@ installXray() {
 
     echoContent skyBlue "\n进度  $1/${totalProgress} : 安装Xray"
 
-    if [[ ! -f "/etc/v2ray-agent/xray/xray" || "${3:-}" == force ]]; then
+    if [[ ! -f "/etc/v2ray-agent/xray/xray" ]]; then
+        if [[ "${prereleaseStatus}" == "true" ]]; then
+            version=$(curl -s "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=5" | jq -r ".[]|select (.prerelease==${prereleaseStatus})|.tag_name" | head -1)
+        else
+            version=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
+        fi
+        echoContent green " ---> Xray-core版本:${version}"
+        installCoreRelease xray "${version}" || return 1
+        updateGeoSite false /etc/v2ray-agent/xray/ || return 1
+    elif [[ "${3:-}" == force ]]; then
         if [[ "${prereleaseStatus}" == "true" ]]; then
             version=$(curl -s "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=5" | jq -r ".[]|select (.prerelease==${prereleaseStatus})|.tag_name" | head -1)
         else
@@ -3281,7 +3317,7 @@ initXrayClients() {
     local users=
     users=[]
     while read -r user; do
-        uuid=$(echo "${user}" | jq -r .id//.uuid)
+        uuid=$(echo "${user}" | jq -r .id//.uuid//.auth)
         email=$(echo "${user}" | jq -r .email//.name | awk -F "[-]" '{print $1}')
         currentUser=
         if echo "${type}" | grep -q "0"; then
@@ -3332,7 +3368,11 @@ initXrayClients() {
 
         # hysteria
         if echo "${type}" | grep -q ",6,"; then
-            currentUser="{\"password\":\"${uuid}\",\"name\":\"${email}-singbox_hysteria2\"}"
+            if [[ "${coreInstallType}" == "1" ]]; then
+                currentUser="{\"auth\":\"${uuid}\",\"email\":\"${email}-xray_hysteria2\"}"
+            else
+                currentUser="{\"password\":\"${uuid}\",\"name\":\"${email}-singbox_hysteria2\"}"
+            fi
 
             users=$(echo "${users}" | jq -r ". +=[${currentUser}]")
         fi
@@ -3693,7 +3733,7 @@ createPortHoppingRules() {
     local otherType=tuic otherTarget=${singBoxTuicPort} otherRange
     if [[ "${type}" == tuic ]]; then
         otherType=hysteria2
-        otherTarget=${singBoxHysteria2Port}
+        otherTarget=${singBoxHysteria2Port:-${xrayHysteria2Port}}
     fi
     otherRange=$(loadPortHoppingConfig "${otherType}" "${otherTarget}" && echo "${hoppingStart} ${hoppingEnd}")
     if [[ -n "${otherRange}" ]]; then
@@ -3869,14 +3909,15 @@ deletePortHoppingRules() {
 }
 
 removeAllPortHopping() {
-    deletePortHoppingRules hysteria2 '' '' "${singBoxHysteria2Port}" &&
+    deletePortHoppingRules hysteria2 '' '' "${singBoxHysteria2Port:-${xrayHysteria2Port}}" &&
         deletePortHoppingRules tuic '' '' "${singBoxTuicPort}"
 }
 
 buildSingBoxHysteria2Node() {
     local port=$1 email=$2 password=$3
+    local listenPort=${singBoxHysteria2Port:-${xrayHysteria2Port}}
     jq -n --arg port "${port}" --arg tag "${email}" --arg password "${password}" --arg host "${currentHost}" \
-        --argjson listenPort "${singBoxHysteria2Port}" --argjson up "${hysteria2ClientUploadSpeed}" \
+        --argjson listenPort "${listenPort}" --argjson up "${hysteria2ClientUploadSpeed}" \
         --argjson down "${hysteria2ClientDownloadSpeed}" --arg interval "${hysteria2HopInterval:-60}s" \
         '{tag:$tag,type:"hysteria2",server:$host,up_mbps:$up,down_mbps:$down,password:$password,tls:{enabled:true,server_name:$host,alpn:["h3"]}} +
         (if $port | contains("-") then {server_ports:[($port | sub("-"; ":"))],hop_interval:$interval} else {server_port:$listenPort} end)'
@@ -3925,7 +3966,7 @@ addPortHopping() {
 portHoppingMenu() {
     local type=$1 targetPort selectPortHoppingStatus
     case "${type}" in
-    hysteria2) targetPort=${singBoxHysteria2Port} ;;
+    hysteria2) targetPort=${singBoxHysteria2Port:-${xrayHysteria2Port}} ;;
     tuic) targetPort=${singBoxTuicPort} ;;
     *) return 1 ;;
     esac
@@ -3960,6 +4001,16 @@ portHoppingMenu() {
     if [[ -n "${subscribePort}" ]]; then
         subscribe false
     fi
+}
+
+manageHysteriaPortHopping() {
+    readInstallType
+    readInstallProtocolType
+    if ! echo "${currentInstallProtocolType}" | grep -q ',6,'; then
+        echoContent yellow " ---> 未检测到Hysteria2入站"
+        return 0
+    fi
+    portHoppingMenu hysteria2
 }
 
 # 初始化tuic端口
@@ -4642,6 +4693,9 @@ initSingBoxPort() {
 
 # 初始化Xray 配置文件
 initXrayConfig() {
+    coreInstallType=1
+    configPath=/etc/v2ray-agent/xray/conf/
+    mkdir -p "${configPath}"
     echoContent skyBlue "\n进度 $2/${totalProgress} : 初始化Xray配置"
     echo
     local uuid=
@@ -4874,6 +4928,35 @@ EOF
         buildXrayXHTTPTLSConfig "${xHTTPTLSPort}" "${domain}" "${customPath}" "$(initXrayClients 14)" | jq . >"${configPath}14_VLESS_XHTTP_TLS_inbounds.json"
     elif [[ -z "$3" ]]; then
         rm /etc/v2ray-agent/xray/conf/14_VLESS_XHTTP_TLS_inbounds.json >/dev/null 2>&1
+    fi
+
+    if echo "${selectCustomInstallType}" | grep -q ",6,"; then
+        initHysteriaPort
+        initHysteria2Network
+        cat <<EOF >/etc/v2ray-agent/xray/conf/06_hysteria2_inbounds.json
+{
+  "inbounds": [{
+    "listen": "::",
+    "port": ${hysteriaPort},
+    "protocol": "hysteria",
+    "settings": {
+      "version": 2,
+      "users": $(initXrayClients 6)
+    },
+    "streamSettings": {
+      "network": "hysteria",
+      "security": "tls",
+      "tlsSettings": {
+        "serverName": "${domain:-${currentHost}}",
+        "certificates": [{"certificateFile": "/etc/v2ray-agent/tls/${domain:-${currentHost}}.crt", "keyFile": "/etc/v2ray-agent/tls/${domain:-${currentHost}}.key"}]
+      },
+      "hysteriaSettings": {"version": 2}
+    }
+  }]
+}
+EOF
+    elif [[ -z "$3" ]]; then
+        rm -f /etc/v2ray-agent/xray/conf/06_hysteria2_inbounds.json
     fi
 
     if echo "${selectCustomInstallType}" | grep -q ",3," || [[ "$1" == "all" ]]; then
@@ -5733,10 +5816,8 @@ EOF
     elif [[ "${type}" == "vlessXHTTP" ]]; then
 
         local xhttpMldsa65Param=
-        local xhttpMldsa65ParamEncoded=
-        if [[ -n "${currentRealityMldsa65Verify}" && "${currentRealityMldsa65Verify}" != "null" ]]; then
+        if [[ "${coreInstallType}" == "1" && -n "${currentRealityMldsa65Verify}" && "${currentRealityMldsa65Verify}" != "null" ]]; then
             xhttpMldsa65Param="&pqv=${currentRealityMldsa65Verify}"
-            xhttpMldsa65ParamEncoded="%26pqv%3D${currentRealityMldsa65Verify}"
         fi
 
         echoContent yellow " ---> 通用格式(VLESS+reality+XHTTP)"
@@ -5767,10 +5848,11 @@ EOF
     reality-opts:
       public-key: ${currentRealityXHTTPPublicKey}
       short-id: 6ba85179e30d4fc2
+      support-x25519mlkem768: true
 EOF
 
         echoContent yellow " ---> 二维码 VLESS(VLESS+reality+XHTTP)"
-        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=vless%3A%2F%2F${id}%40${add}%3A${port}%3Fencryption%3Dnone%26security%3Dreality${xhttpMldsa65ParamEncoded}%26type%3Dxhttp%26sni%3D${xrayVLESSRealityXHTTPServerName}%26fp%3Dchrome%26path%3D${path}%26host%3D${xrayVLESSRealityXHTTPServerName}%26pbk%3D${currentRealityXHTTPPublicKey}%26sid%3D6ba85179e30d4fc2%23${email}\n"
+        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=vless%3A%2F%2F${id}%40${add}%3A${port}%3Fencryption%3Dnone%26security%3Dreality%26type%3Dxhttp%26sni%3D${xrayVLESSRealityXHTTPServerName}%26fp%3Dchrome%26path%3D${path}%26host%3D${xrayVLESSRealityXHTTPServerName}%26pbk%3D${currentRealityXHTTPPublicKey}%26sid%3D6ba85179e30d4fc2%23${email}\n"
 
     elif
         [[ "${type}" == "vlessgrpc" ]]
@@ -5870,9 +5952,9 @@ EOF
             multiPortEncode="mport%3D${port}%26"
         fi
 
-        echoContent green "    hysteria2://${id}@${currentHost}:${singBoxHysteria2Port}?${multiPort}peer=${currentHost}&insecure=0&sni=${currentHost}&alpn=h3#${email}\n"
+        echoContent green "    hysteria2://${id}@${currentHost}:${port}?${multiPort}peer=${currentHost}&insecure=0&sni=${currentHost}&alpn=h3#${email}\n"
         cat <<EOF >>"${outputRoot}/default/${user}" || return 1
-hysteria2://${id}@${currentHost}:${singBoxHysteria2Port}?${multiPort}peer=${currentHost}&insecure=0&sni=${currentHost}&alpn=h3#${email}
+hysteria2://${id}@${currentHost}:${port}?${multiPort}peer=${currentHost}&insecure=0&sni=${currentHost}&alpn=h3#${email}
 EOF
         echoContent yellow " ---> v2rayN(hysteria+TLS)"
         jq -n --arg server "${currentHost}:${port}" --arg password "${id}" --arg host "${currentHost}" \
@@ -5899,24 +5981,28 @@ EOF
         echo "${singBoxSubscribeLocalConfig}" | jq . >"${outputRoot}/sing-box/${user}" || return 1
 
         echoContent yellow " ---> 二维码 Hysteria2(TLS)"
-        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=hysteria2%3A%2F%2F${id}%40${currentHost}%3A${singBoxHysteria2Port}%3F${multiPortEncode}peer%3D${currentHost}%26insecure%3D0%26sni%3D${currentHost}%26alpn%3Dh3%23${email}\n"
+        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=hysteria2%3A%2F%2F${id}%40${currentHost}%3A${port}%3F${multiPortEncode}peer%3D${currentHost}%26insecure%3D0%26sni%3D${currentHost}%26alpn%3Dh3%23${email}\n"
 
     elif [[ "${type}" == "vlessReality" ]]; then
         local realityServerName=${xrayVLESSRealityServerName}
         local publicKey=${currentRealityPublicKey}
         local realityMldsa65Verify=${currentRealityMldsa65Verify}
+        local realityMldsa65Param=
+        if [[ "${coreInstallType}" == "1" && -n "${realityMldsa65Verify}" && "${realityMldsa65Verify}" != "null" ]]; then
+            realityMldsa65Param="&pqv=${realityMldsa65Verify}"
+        fi
 
         if [[ "${coreInstallType}" == "2" ]]; then
             realityServerName=${singBoxVLESSRealityVisionServerName}
             publicKey=${singBoxVLESSRealityPublicKey}
         fi
         echoContent yellow " ---> 通用格式(VLESS+reality+uTLS+Vision)"
-        echoContent green "    vless://${id}@$(getPublicIP):${port}?encryption=none&security=reality&pqv=${realityMldsa65Verify}&type=tcp&sni=${realityServerName}&fp=chrome&pbk=${publicKey}&sid=6ba85179e30d4fc2&flow=xtls-rprx-vision#${email}\n"
+        echoContent green "    vless://${id}@$(getPublicIP):${port}?encryption=none&security=reality${realityMldsa65Param}&type=tcp&sni=${realityServerName}&fp=chrome&pbk=${publicKey}&sid=6ba85179e30d4fc2&flow=xtls-rprx-vision#${email}\n"
 
         echoContent yellow " ---> 格式化明文(VLESS+reality+uTLS+Vision)"
-        echoContent green "协议类型:VLESS reality，地址:$(getPublicIP)，publicKey:${publicKey}，shortId: 6ba85179e30d4fc2，pqv=${realityMldsa65Verify}，serverNames：${realityServerName}，端口:${port}，用户ID:${id}，传输方式:tcp，账户名:${email}\n"
+        echoContent green "协议类型:VLESS reality，地址:$(getPublicIP)，publicKey:${publicKey}，shortId: 6ba85179e30d4fc2${realityMldsa65Param:+，pqv=${realityMldsa65Verify}}，serverNames：${realityServerName}，端口:${port}，用户ID:${id}，传输方式:tcp，账户名:${email}\n"
         cat <<EOF >>"${outputRoot}/default/${user}" || return 1
-vless://${id}@$(getPublicIP):${port}?encryption=none&security=reality&pqv=${realityMldsa65Verify}&type=tcp&sni=${realityServerName}&fp=chrome&pbk=${publicKey}&sid=6ba85179e30d4fc2&flow=xtls-rprx-vision#${email}
+vless://${id}@$(getPublicIP):${port}?encryption=none&security=reality${realityMldsa65Param}&type=tcp&sni=${realityServerName}&fp=chrome&pbk=${publicKey}&sid=6ba85179e30d4fc2&flow=xtls-rprx-vision#${email}
 EOF
         cat <<EOF >>"${outputRoot}/clashMeta/${user}" || return 1
   - name: "${email}"
@@ -5933,6 +6019,7 @@ EOF
     reality-opts:
       public-key: ${publicKey}
       short-id: 6ba85179e30d4fc2
+      support-x25519mlkem768: true
     client-fingerprint: chrome
 EOF
 
@@ -5946,6 +6033,10 @@ EOF
         local realityServerName=${xrayVLESSRealityServerName}
         local publicKey=${currentRealityPublicKey}
         local realityMldsa65Verify=${currentRealityMldsa65Verify}
+        local realityMldsa65Param=
+        if [[ "${coreInstallType}" == "1" && -n "${realityMldsa65Verify}" && "${realityMldsa65Verify}" != "null" ]]; then
+            realityMldsa65Param="&pqv=${realityMldsa65Verify}"
+        fi
 
         if [[ "${coreInstallType}" == "2" ]]; then
             realityServerName=${singBoxVLESSRealityGRPCServerName}
@@ -5953,14 +6044,12 @@ EOF
         fi
 
         echoContent yellow " ---> 通用格式(VLESS+reality+uTLS+gRPC)"
-        # pqv=${realityMldsa65Verify}&
-        echoContent green "    vless://${id}@$(getPublicIP):${port}?encryption=none&security=reality&type=grpc&sni=${realityServerName}&fp=chrome&pbk=${publicKey}&sid=6ba85179e30d4fc2&path=grpc&serviceName=grpc#${email}\n"
+        echoContent green "    vless://${id}@$(getPublicIP):${port}?encryption=none&security=reality${realityMldsa65Param}&type=grpc&sni=${realityServerName}&fp=chrome&pbk=${publicKey}&sid=6ba85179e30d4fc2&path=grpc&serviceName=grpc#${email}\n"
 
         echoContent yellow " ---> 格式化明文(VLESS+reality+uTLS+gRPC)"
-        # pqv=${realityMldsa65Verify}，
-        echoContent green "协议类型:VLESS reality，serviceName:grpc，地址:$(getPublicIP)，publicKey:${publicKey}，shortId: 6ba85179e30d4fc2，serverNames：${realityServerName}，端口:${port}，用户ID:${id}，传输方式:gRPC，client-fingerprint：chrome，账户名:${email}\n"
+        echoContent green "协议类型:VLESS reality，serviceName:grpc，地址:$(getPublicIP)，publicKey:${publicKey}，shortId: 6ba85179e30d4fc2${realityMldsa65Param:+，pqv=${realityMldsa65Verify}}，serverNames：${realityServerName}，端口:${port}，用户ID:${id}，传输方式:gRPC，client-fingerprint：chrome，账户名:${email}\n"
         cat <<EOF >>"${outputRoot}/default/${user}" || return 1
-vless://${id}@$(getPublicIP):${port}?encryption=none&security=reality&pqv=${realityMldsa65Verify}&type=grpc&sni=${realityServerName}&fp=chrome&pbk=${publicKey}&sid=6ba85179e30d4fc2&path=grpc&serviceName=grpc#${email}
+vless://${id}@$(getPublicIP):${port}?encryption=none&security=reality${realityMldsa65Param}&type=grpc&sni=${realityServerName}&fp=chrome&pbk=${publicKey}&sid=6ba85179e30d4fc2&path=grpc&serviceName=grpc#${email}
 EOF
         cat <<EOF >>"${outputRoot}/clashMeta/${user}" || return 1
   - name: "${email}"
@@ -5975,6 +6064,7 @@ EOF
     reality-opts:
       public-key: ${publicKey}
       short-id: 6ba85179e30d4fc2
+      support-x25519mlkem768: true
     grpc-opts:
       grpc-service-name: "grpc"
     client-fingerprint: chrome
@@ -6159,7 +6249,7 @@ collectAccountUsers() {
                     '([.[] | select(.key == $key)][0] // {key:$key,names:[],protocols:[]}) as $current |
                      map(select(.key != $key)) + [($current | .names += [$name] | .names |= unique | .protocols += [$protocol] | .protocols |= unique)]' \
                     <<<"${users}") || return 1
-            done < <(jq -c '[.inbounds[]? | (.settings.clients[]?, .users[]?)] | .[]' "${file}")
+            done < <(jq -c '[.inbounds[]? | (.settings.clients[]?, .settings.users[]?, .users[]?)] | .[]' "${file}")
         done < <(find "${dir}" -maxdepth 1 -type f -name '*_inbounds.json' -print0 2>/dev/null)
     done
     jq -c 'sort_by(.key)' <<<"${users}"
@@ -6358,26 +6448,29 @@ showAccounts() {
     fi
     # hysteria2
     if echo ${currentInstallProtocolType} | grep -q ",6," || [[ -n "${hysteriaPort}" ]]; then
-        readPortHopping "hysteria2" "${singBoxHysteria2Port}"
+        readPortHopping "hysteria2" "${singBoxHysteria2Port:-${xrayHysteria2Port}}"
         echoContent skyBlue "\n================================  Hysteria2 TLS [推荐] ================================\n"
         local hysteriaConfigPath="${configPath}"
-        if [[ "${coreInstallType}" == "1" ]]; then
-            hysteriaConfigPath="${singBoxConfigPath}"
-        fi
+        [[ "${coreInstallType}" != "2" ]] || hysteriaConfigPath="${singBoxConfigPath}"
         local hysteria2DefaultPort=
         if [[ -n "${hysteria2PortHoppingStart}" && -n "${hysteria2PortHoppingEnd}" ]]; then
             hysteria2DefaultPort="${hysteria2PortHopping}"
         else
-            hysteria2DefaultPort=${singBoxHysteria2Port}
+            hysteria2DefaultPort=${singBoxHysteria2Port:-${xrayHysteria2Port}}
         fi
 
-        accountUsers=$(readAccountUsers '.inbounds[]|.users[]' "${hysteriaConfigPath}06_hysteria2_inbounds.json") || return 1
+        local hysteriaUsersFilter='.inbounds[]|.settings.users[]'
+        [[ "${coreInstallType}" != "2" ]] || hysteriaUsersFilter='.inbounds[]|.users[]'
+        accountUsers=$(readAccountUsers "${hysteriaUsersFilter}" "${hysteriaConfigPath}06_hysteria2_inbounds.json") || return 1
         while IFS= read -r user; do
             [[ -n "${user}" ]] || continue
             if [[ -n "${accountViewKey}" ]] && ! accountUserMatches "${user}" "${accountViewKey}"; then continue; fi
-            echoContent skyBlue "\n ---> 账号:$(echo "${user}" | jq -r .name)"
+            local hysteriaUserName hysteriaUserPassword
+            hysteriaUserName=$(echo "${user}" | jq -r '.name // .email')
+            hysteriaUserPassword=$(echo "${user}" | jq -r '.password // .auth')
+            echoContent skyBlue "\n ---> 账号:${hysteriaUserName}"
             echo
-            defaultBase64Code hysteria "${hysteria2DefaultPort}" "$(echo "${user}" | jq -r .name)" "$(echo "${user}" | jq -r .password)" || return 1
+            defaultBase64Code hysteria "${hysteria2DefaultPort}" "${hysteriaUserName}" "${hysteriaUserPassword}" || return 1
         done <<<"${accountUsers}"
 
     fi
@@ -6477,7 +6570,7 @@ showAccounts() {
     fi
     # VLESS Reality XHTTP
     if echo ${currentInstallProtocolType} | grep -q ",12,"; then
-        echoContent skyBlue "\n================================ VLESS Reality XHTTP TLS [仅CDN推荐] ================================\n"
+        echoContent skyBlue "\n================================ VLESS REALITY XHTTP ================================\n"
 
         accountUsers=$(readAccountUsers '(.inbounds[0].settings.clients//.inbounds[0].users)[]' "${configPath}12_VLESS_XHTTP_inbounds.json") || return 1
         while IFS= read -r user; do
@@ -6504,7 +6597,7 @@ showAccounts() {
     fi
     # VLESS XHTTP TLS tunnel (Xray-only subscriptions)
     if echo ${currentInstallProtocolType} | grep -q ",14," && [[ -f "${configPath}14_VLESS_XHTTP_TLS_inbounds.json" ]]; then
-        echoContent skyBlue "\n================================ VLESS XHTTP TLS  ================================\n"
+        echoContent skyBlue "\n================================ VLESS XHTTP TLS [支持CDN] ================================\n"
         local xhttpTLSCDNAddress=
         if [[ -f "/etc/v2ray-agent/cdn" ]]; then
             xhttpTLSCDNAddress=$(head -1 "/etc/v2ray-agent/cdn" | tr -d '\r\n')
@@ -6971,7 +7064,7 @@ customUUID() {
         if [[ "${coreInstallType}" == "1" ]]; then
             local referenceConfig
             referenceConfig=$(getXrayAccountReferenceConfig) || return 1
-            checkUUID=$(jq -r --arg currentUUID "$currentCustomUUID" '(.inbounds[0].settings.clients // .inbounds[1].settings.clients)[]? | select(.id == $currentUUID or .password == $currentUUID) | .email' "${referenceConfig}")
+            checkUUID=$(jq -r --arg currentUUID "$currentCustomUUID" '(.inbounds[0].settings.clients // .inbounds[1].settings.clients // .inbounds[0].settings.users)[]? | select(.id == $currentUUID or .password == $currentUUID or .auth == $currentUUID) | .email // .name' "${referenceConfig}")
         elif [[ "${coreInstallType}" == "2" ]]; then
             checkUUID=$(jq -r --arg currentUUID "$currentCustomUUID" ".inbounds[0].users[] | select(.uuid == \$currentUUID) | .name//.username" ${configPath}${frontingType}.json)
         fi
@@ -6997,7 +7090,7 @@ customUserEmail() {
         if [[ "${coreInstallType}" == "1" ]]; then
             local referenceConfig
             referenceConfig=$(getXrayAccountReferenceConfig) || return 1
-            checkEmail=$(jq -r --arg currentEmail "$currentEmailKey" '(.inbounds[0].settings.clients // .inbounds[1].settings.clients)[]? | select((.email // "") | split("-")[0] == $currentEmail) | .email' "${referenceConfig}")
+            checkEmail=$(jq -r --arg currentEmail "$currentEmailKey" '(.inbounds[0].settings.clients // .inbounds[1].settings.clients // .inbounds[0].settings.users)[]? | select((.email // .name // "") | split("-")[0] == $currentEmail) | .email // .name' "${referenceConfig}")
         elif
             [[ "${coreInstallType}" == "2" ]]
         then
@@ -7154,15 +7247,15 @@ addUser() {
         # hysteria2
         if echo ${currentInstallProtocolType} | grep -q ",6,"; then
             local clients=
-
             if [[ "${coreInstallType}" == "1" ]]; then
                 clients=$(initXrayClients 6 "${uuid}" "${email}")
+                clients=$(jq -r ".inbounds[0].settings.users = ${clients}" "${configPath}06_hysteria2_inbounds.json")
+                echo "${clients}" | jq . >"${configPath}06_hysteria2_inbounds.json"
             elif [[ -n "${singBoxConfigPath}" ]]; then
                 clients=$(initSingBoxClients 6 "${uuid}" "${email}")
+                clients=$(jq -r ".inbounds[0].users = ${clients}" "${singBoxConfigPath}06_hysteria2_inbounds.json")
+                echo "${clients}" | jq . >"${singBoxConfigPath}06_hysteria2_inbounds.json"
             fi
-
-            clients=$(jq -r ".inbounds[0].users = ${clients}" "${singBoxConfigPath}06_hysteria2_inbounds.json")
-            echo "${clients}" | jq . >"${singBoxConfigPath}06_hysteria2_inbounds.json"
         fi
 
         # tuic
@@ -7229,16 +7322,16 @@ removeUser() {
             echoContent red " ---> 未找到可管理的Xray用户配置"
             return 1
         }
-        jq -r -c '(.inbounds[0].settings.clients // .inbounds[1].settings.clients)[]?|.email' "${referenceConfig}" | awk '{print NR""":"$0}'
+        jq -r -c '(.inbounds[0].settings.clients // .inbounds[1].settings.clients // .inbounds[0].settings.users)[]?|(.email // .name)' "${referenceConfig}" | awk '{print NR""":"$0}'
         read -r -p "请选择要删除的用户编号[仅支持单个删除]:" delUserIndex
         if ! delUserIndex=$(jq -enr --arg index "${delUserIndex}" \
-            --argjson count "$(jq '(.inbounds[0].settings.clients // .inbounds[1].settings.clients) | length' "${referenceConfig}")" '
+            --argjson count "$(jq '(.inbounds[0].settings.clients // .inbounds[1].settings.clients // .inbounds[0].settings.users) | length' "${referenceConfig}")" '
               select($index | test("^[0-9]+$")) | ($index | tonumber) |
               select(. >= 1 and . <= $count) | . - 1'); then
             echoContent red " ---> 选择错误"
             return 1
         else
-            uuid=$(jq -r --argjson index "${delUserIndex}" '(.inbounds[0].settings.clients // .inbounds[1].settings.clients)[$index].id // (.inbounds[0].settings.clients // .inbounds[1].settings.clients)[$index].password // empty' "${referenceConfig}")
+            uuid=$(jq -r --argjson index "${delUserIndex}" '(.inbounds[0].settings.clients // .inbounds[1].settings.clients // .inbounds[0].settings.users)[$index].id // (.inbounds[0].settings.clients // .inbounds[1].settings.clients // .inbounds[0].settings.users)[$index].password // (.inbounds[0].settings.users // [])[ $index ].auth // empty' "${referenceConfig}")
             [[ -n "${uuid}" ]] || {
                 echoContent red " ---> 无法读取所选用户的UUID"
                 return 1
@@ -7307,8 +7400,13 @@ removeUser() {
 
         if echo ${currentInstallProtocolType} | grep -q ",6,"; then
             local hysteriaResult
-            hysteriaResult=$(jq -r 'del(.inbounds[0].users['"${delUserIndex}"'])' "${singBoxConfigPath}06_hysteria2_inbounds.json")
-            echo "${hysteriaResult}" | jq . >"${singBoxConfigPath}06_hysteria2_inbounds.json"
+            if [[ "${coreInstallType}" == "1" ]]; then
+                hysteriaResult=$(jq -r 'del(.inbounds[0].settings.users['"${delUserIndex}"'])' "${configPath}06_hysteria2_inbounds.json")
+                echo "${hysteriaResult}" | jq . >"${configPath}06_hysteria2_inbounds.json"
+            else
+                hysteriaResult=$(jq -r 'del(.inbounds[0].users['"${delUserIndex}"'])' "${singBoxConfigPath}06_hysteria2_inbounds.json")
+                echo "${hysteriaResult}" | jq . >"${singBoxConfigPath}06_hysteria2_inbounds.json"
+            fi
         fi
         if [[ "${coreInstallType}" != "1" ]] && echo ${currentInstallProtocolType} | grep -q ",7,"; then
             local vlessRealityResult
@@ -10491,11 +10589,12 @@ customXrayInstall() {
     #    echoContent yellow "2.Trojan+TLS+gRPC[仅CDN推荐]"
     echoContent yellow "3.VMess+TLS+WS[仅CDN推荐]"
     echoContent yellow "4.Trojan+TLS[不推荐]"
+    echoContent yellow "6.Hysteria2"
     #    echoContent yellow "5.VLESS+TLS+gRPC[仅CDN推荐]"
     echoContent yellow "7.VLESS+Reality+uTLS+Vision[推荐]"
     # echoContent yellow "8.VLESS+Reality+gRPC"
-    echoContent yellow "12.VLESS+Reality+XHTTP+TLS[CDN可用]"
-    echoContent yellow "14.VLESS+XHTTP+TLS[随机端口，无需Nginx]"
+    echoContent yellow "12.VLESS+REALITY+XHTTP"
+    echoContent yellow "14.VLESS+XHTTP+TLS[支持CDN，随机端口，无需Nginx]"
     read -r -p "请选择[多选]，[例如:1,2,3]:" selectCustomInstallType
     echoContent skyBlue "--------------------------------------------------------------"
     if echo "${selectCustomInstallType}" | grep -q "，"; then
@@ -10549,9 +10648,11 @@ customXrayInstall() {
         # 安装Xray
         installXray 7 false || return 1
         installXrayService 8
-        initXrayConfig custom 9
-        cleanUp singBoxDel
-        if xraySelectionNeedsNginx "${selectCustomInstallType}"; then
+        initXrayConfig custom 9 true
+        if ! [[ "${selectCustomInstallType}" == *,6,* && -f /etc/v2ray-agent/sing-box/conf/config.json ]]; then
+            cleanUp singBoxDel
+        fi
+        if xraySelectionNeedsCertificate "${selectCustomInstallType}"; then
             installCronTLS 10
         fi
 
@@ -12174,7 +12275,7 @@ menu() {
     cd "$HOME" || exit
     echoContent red "\n=============================================================="
     echoContent green "作者：mack-a"
-    echoContent green "当前版本：v3.5.33"
+    echoContent green "当前版本：v3.5.37"
     echoContent green "Github：https://github.com/mack-a/v2ray-agent"
     echoContent green "描述：八合一共存脚本\c"
     showInstallStatus
@@ -12198,7 +12299,7 @@ menu() {
 
     echoContent yellow "2.任意组合安装"
     echoContent yellow "3.一键无域名Reality"
-    echoContent yellow "4.Hysteria2管理"
+    echoContent yellow "4.Hysteria2端口跳跃管理"
     echoContent yellow "5.REALITY管理"
     echoContent yellow "6.Tuic管理"
 
@@ -12232,7 +12333,7 @@ menu() {
         selectCoreInstall
         ;;
     4)
-        manageHysteria
+        manageHysteriaPortHopping
         ;;
     5)
         manageReality 1

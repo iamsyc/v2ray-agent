@@ -2,6 +2,8 @@
 
 本仓库是 [mack-a/v2ray-agent](https://github.com/mack-a/v2ray-agent) 的 1Panel 兼容分支。中文入口 `install.sh` 保留独立 Nginx 模式，并在选择 Xray-core 后提供 **1Panel OpenResty** 安装模式。英文入口和独立 sing-box 安装流程保持上游行为。
 
+上游功能补丁已同步至 `v3.5.37`（`140b165`），保留本 fork 的 1Panel 后端和原有测试。新增 Xray 原生 Hysteria2 沿用独立模式；1Panel 模式的协议范围保持不变。
+
 ## 1Panel OpenResty 模式
 
 先在服务器安装并启动 **1Panel v2、其 OpenResty 应用**，创建网站和有效证书，并开启该证书的自动续期。OpenResty 须使用 host 网络并包含 `stream_ssl_preread` 模块。安装器会列出面板实际的网站与证书 ID，供选择；无须开启面板公网 API，也不需要提供 API Key。
@@ -45,19 +47,24 @@ python3 -m unittest discover -s checks -p 'test_onepanel_backend.py' -v
 [![Official Website](https://img.shields.io/badge/Website-v2ray--agent.com-blue)](https://www.v2ray-agent.com/)
 [![English Version](https://img.shields.io/badge/English-Version-blue)](documents/en/README_EN.md)
 
-Xray-core/sing-box 一键脚本快速安装
+基于 Bash 的 Xray-core / sing-box 安装与管理脚本，支持普通主机部署和 Docker Reality 独立部署。
 
 ## 功能
 
-*   **多核心支持:** 支持 Xray-core 和 sing-box.
-*   **多协议支持:** 支持 VLESS, VMess, Trojan, Hysteria2, Tuic, NaiveProxy 等多种协议.
-*   **自动TLS:** 自动申请和续订 SSL 证书.
-*   **易于管理:** 提供简单的菜单来管理用户、端口和配置.
-*   **订阅支持:** 生成和管理订阅链接.
-*   **分流管理:** 提供wireguard、IPv6、Socks5、DNS、VMess(ws)、SNI反向代理，可用于解锁流媒体、规避IP验证等作用.
-*   **目标域名管理:** 提供域名黑名单管理，可用于禁止访问指定网站.
-*   **BT下载管理:** 可用于禁止下载P2P相关内容.
+*   **多核心支持:** 支持 Xray-core 和 sing-box，可按需安装单核心或组合使用.
+*   **多协议支持:** 支持 VLESS（TLS、Reality、XHTTP）、VMess、Trojan、Hysteria2、Tuic、NaiveProxy、AnyTLS，以及独立 SOCKS5 入站.
+*   **TLS 与 Reality:** TLS 协议可通过 acme.sh 自动申请和续订证书；Reality 支持无域名部署.
+*   **易于管理:** 提供菜单管理用户、端口、配置、核心版本、日志和证书，并支持二维码及客户端节点信息输出.
+*   **订阅支持:** 生成和管理订阅链接，支持远程订阅配置.
+*   **分流管理:** 提供 WARP/WireGuard（IPv4/IPv6）、IPv6、SOCKS5、DNS、VMess+WS、SNI 反向代理等分流能力，可用于流媒体等场景.
+*   **网络策略管理:** 支持 Hysteria2 端口跳跃、域名黑名单和 BT/P2P 下载限制.
+*   **Docker Reality:** 无需域名即可通过 Docker 部署 VLESS-Reality，支持 Vision、XHTTP 或同时启用两种模式，并提供交互式和命令行参数模式.
 *   **更多内容请访问[官方网站](https://www.v2ray-agent.com/categories/jiao-cheng)、[备用](https://www.592083.com/categories/jiao-cheng)、[X](https://x.com/v2rayagent)**
+
+## 环境要求
+
+*   **脚本版:** Linux、root 权限，支持 CentOS、Debian、Ubuntu 和 Alpine；支持 amd64/x86_64、arm64/aarch64.
+*   **Docker Reality:** Linux、root 或 sudo 权限，以及正在运行的 Docker；脚本可在交互模式下提示安装 Docker.
 
 ## 快速开始
 
