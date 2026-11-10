@@ -82,6 +82,21 @@ echoContent() {
         ${echoType} "\033[32m${printN}$2 \033[0m"
         ;;
         # 白色
+    "brightPurple")
+        ${echoType} "\033[95m${printN}$2 \033[0m"
+        ;;
+    "brightGreen")
+        ${echoType} "\033[92m${printN}$2 \033[0m"
+        ;;
+    "gold")
+        ${echoType} "\033[93m${printN}$2 \033[0m"
+        ;;
+    "blue")
+        ${echoType} "\033[94m${printN}$2 \033[0m"
+        ;;
+    "gray")
+        ${echoType} "\033[90m${printN}$2 \033[0m"
+        ;;
     "white")
         ${echoType} "\033[37m${printN}$2 \033[0m"
         ;;
@@ -566,10 +581,21 @@ deleteXrayUserByUUID() {
         fi
         index=$((index + 1))
     done
+    for file in "${files[@]}"; do
+        local userCore=xray
+        [[ "$file" != "${singBoxConfigPath}"* || -z "${singBoxConfigPath}" ]] || userCore=sing-box
+        socks5OutboundCheckUserRemoval "$userCore" "$file" uuid "$uuidValue" || {
+            rm -rf "$backupDir"
+            return 1
+        }
+    done
     index=0
     for file in "${files[@]}"; do
         if ! cmp -s "${backupDir}/${index}.backup" "${backupDir}/${index}.json"; then
-            tmpFile=$(mktemp "${file}.delete.XXXXXX") || { failed=true; break; }
+            tmpFile=$(mktemp "${file}.delete.XXXXXX") || {
+                failed=true
+                break
+            }
             if ! cp -p "${file}" "${tmpFile}" ||
                 ! cat "${backupDir}/${index}.json" >"${tmpFile}" ||
                 ! mv -f "${tmpFile}" "${file}"; then
@@ -1093,10 +1119,34 @@ checkFirewalldAllowPort() {
     fi
 }
 
-# 读取Tuic配置
+# Xray client bandwidth hints stay outside the core configuration directory.
+readXrayHysteria2Network() {
+    local networkFile=/etc/v2ray-agent/xray/hysteria2_network.json
+    hysteria2ClientUploadSpeed=50
+    hysteria2ClientDownloadSpeed=100
+    [[ -f "${networkFile}" ]] || return 0
+    hysteria2ClientUploadSpeed=$(jq -r '.upload_mbps // 50' "${networkFile}") || return 1
+    hysteria2ClientDownloadSpeed=$(jq -r '.download_mbps // 100' "${networkFile}") || return 1
+    [[ "${hysteria2ClientUploadSpeed}" =~ ^[0-9]+([.][0-9]+)?$ ]] || hysteria2ClientUploadSpeed=50
+    [[ "${hysteria2ClientDownloadSpeed}" =~ ^[0-9]+([.][0-9]+)?$ ]] || hysteria2ClientDownloadSpeed=100
+}
+
+saveXrayHysteria2Network() {
+    local networkFile=/etc/v2ray-agent/xray/hysteria2_network.json
+    [[ "${hysteria2ClientUploadSpeed}" =~ ^[0-9]+([.][0-9]+)?$ ]] || hysteria2ClientUploadSpeed=50
+    [[ "${hysteria2ClientDownloadSpeed}" =~ ^[0-9]+([.][0-9]+)?$ ]] || hysteria2ClientDownloadSpeed=100
+    mkdir -p "${networkFile%/*}" || return 1
+    jq -n --argjson upload "${hysteria2ClientUploadSpeed}" --argjson download "${hysteria2ClientDownloadSpeed}" \
+        '{upload_mbps:$upload,download_mbps:$download}' >"${networkFile}.tmp" &&
+        mv -f "${networkFile}.tmp" "${networkFile}"
+}
+
+# Read bandwidth from the core that owns the Hysteria2 inbound.
 readSingBoxConfig() {
     tuicPort=
     hysteriaPort=
+    hysteria2ClientUploadSpeed=
+    hysteria2ClientDownloadSpeed=
     if [[ -n "${singBoxConfigPath}" ]]; then
 
         if [[ -f "${singBoxConfigPath}09_tuic_inbounds.json" ]]; then
@@ -1104,13 +1154,17 @@ readSingBoxConfig() {
             tuicAlgorithm=$(jq -r '.inbounds[0].congestion_control' "${singBoxConfigPath}09_tuic_inbounds.json")
         fi
         if [[ -f "${singBoxConfigPath}06_hysteria2_inbounds.json" ]]; then
-            hysteriaPort=$(jq -r '.inbounds[0].listen_port' "${singBoxConfigPath}06_hysteria2_inbounds.json")
-            hysteria2ClientUploadSpeed=$(jq -r '.inbounds[0].down_mbps' "${singBoxConfigPath}06_hysteria2_inbounds.json")
-            hysteria2ClientDownloadSpeed=$(jq -r '.inbounds[0].up_mbps' "${singBoxConfigPath}06_hysteria2_inbounds.json")
+            singBoxHysteria2Port=$(jq -r '.inbounds[0].listen_port' "${singBoxConfigPath}06_hysteria2_inbounds.json")
+            if [[ "${coreInstallType}" == "2" || ! -f "${configPath}06_hysteria2_inbounds.json" ]]; then
+                hysteriaPort=${singBoxHysteria2Port}
+                hysteria2ClientUploadSpeed=$(jq -r '.inbounds[0].down_mbps' "${singBoxConfigPath}06_hysteria2_inbounds.json")
+                hysteria2ClientDownloadSpeed=$(jq -r '.inbounds[0].up_mbps' "${singBoxConfigPath}06_hysteria2_inbounds.json")
+            fi
         fi
     fi
     if [[ "${coreInstallType}" == "1" && -f "${configPath}06_hysteria2_inbounds.json" ]]; then
         hysteriaPort=$(jq -r '.inbounds[0].port' "${configPath}06_hysteria2_inbounds.json")
+        readXrayHysteria2Network || return 1
     fi
     if [[ -n "${hysteriaPort}" ]]; then
         [[ "${hysteria2ClientUploadSpeed}" =~ ^[0-9]+([.][0-9]+)?$ ]] || hysteria2ClientUploadSpeed=50
@@ -1384,13 +1438,68 @@ showInstallStatus() {
     fi
 }
 
+# Remove a core service without assuming that it matches coreInstallType.
+removeCoreService() {
+    local core=$1 unit="$1.service" initScript="/etc/init.d/$1"
+    local loadState execStart manager= executable="/etc/v2ray-agent/$1/$1"
+    case "$core" in xray | sing-box) ;; *) return 2 ;; esac
+
+    if [[ "$release" == alpine ]]; then
+        if [[ -f "$initScript" ]] &&
+            grep -Fxq "command=\"$executable\"" "$initScript" &&
+            [[ $(grep -Ec '^[[:space:]]*(export[[:space:]]+)?command[[:space:]]*=' "$initScript") == 1 ]]; then
+            manager=openrc
+            if rc-service "$core" status >/dev/null 2>&1; then
+                rc-service "$core" stop || return 1
+            fi
+        fi
+    elif command -v systemctl >/dev/null 2>&1; then
+        loadState=$(systemctl show -p LoadState --value "$unit") || return 1
+        if [[ -n "$loadState" && "$loadState" != not-found ]]; then
+            execStart=$(systemctl show -p ExecStart --value "$unit") || return 1
+            # Other packages can provide units with the same names.
+            if [[ "$execStart" == "{ path=$executable ;"* ]]; then
+                manager=systemd
+                systemctl stop "$unit" || return 1
+                if systemctl is-active --quiet "$unit"; then
+                    echoContent red " ---> $unit: service is still active"
+                    return 1
+                fi
+            fi
+        fi
+    elif [[ -e "/etc/systemd/system/$unit" || -L "/etc/systemd/system/$unit" ]]; then
+        echoContent red " ---> $unit: systemctl is unavailable"
+        return 1
+    fi
+
+    # Keep the service definition and config if an orphan process still uses them.
+    if pgrep -f "^$executable([[:space:]]|$)" >/dev/null 2>&1; then
+        echoContent red " ---> $core: managed process is still running; cleanup stopped"
+        return 1
+    fi
+    case "$manager" in
+    openrc)
+        if [[ -e "/etc/runlevels/default/$core" || -L "/etc/runlevels/default/$core" ]]; then
+            rc-update del "$core" default || return 1
+        fi
+        rm -f "$initScript" || return 1
+        ;;
+    systemd)
+        systemctl disable "$unit" || return 1
+        rm -f "/etc/systemd/system/$unit" || return 1
+        systemctl daemon-reload || return 1
+        ;;
+    esac
+    return 0
+}
+
 # 清理旧残留
 cleanUp() {
     if [[ "$1" == "xrayDel" ]]; then
-        handleXray stop
+        removeCoreService xray || return 1
         rm -rf /etc/v2ray-agent/xray/*
     elif [[ "$1" == "singBoxDel" ]]; then
-        handleSingBox stop
+        removeCoreService sing-box || return 1
         rm -rf /etc/v2ray-agent/sing-box/conf/config.json >/dev/null 2>&1
         rm -rf /etc/v2ray-agent/sing-box/conf/config/* >/dev/null 2>&1
     fi
@@ -1582,7 +1691,7 @@ installTools() {
             read -r nginxMajor nginxMinor < <(printf '%s\n' "${nginxVersion}" | sed -nE 's@^.*nginx/([0-9]+)\.([0-9]+).*@\1 \2@p')
             if ! [[ "${nginxMajor}" =~ ^[0-9]+$ && "${nginxMinor}" =~ ^[0-9]+$ ]]; then
                 echoContent yellow " ---> 无法可靠读取Nginx版本，跳过版本重装检查"
-            elif (( nginxMajor < 1 || (nginxMajor == 1 && nginxMinor < 14) )); then
+            elif ((nginxMajor < 1 || (nginxMajor == 1 && nginxMinor < 14))); then
                 read -r -p "读取到当前的Nginx版本不支持gRPC，会导致安装失败，是否卸载Nginx后重新安装 ？[y/n]:" unInstallNginxStatus
                 if [[ "${unInstallNginxStatus}" == "y" ]]; then
                     ${removeType} nginx >/dev/null 2>&1
@@ -2720,11 +2829,11 @@ renewalTLS() {
     local remainingSeconds=$((expiryTime - currentTime))
     local remainingDays
     local tlsStatus
-    if (( remainingSeconds <= 0 )); then
+    if ((remainingSeconds <= 0)); then
         remainingDays=0
         tlsStatus="已过期"
     else
-        remainingDays=$(( (remainingSeconds + 86399) / 86400 ))
+        remainingDays=$(((remainingSeconds + 86399) / 86400))
         tlsStatus=${remainingDays}
     fi
 
@@ -2732,7 +2841,7 @@ renewalTLS() {
     echoContent skyBlue " ---> 证书真实到期时间:$(date -d @"${expiryTime}" +"%F %H:%M:%S")"
     echoContent skyBlue " ---> 证书剩余天数:${tlsStatus}"
 
-    if (( remainingSeconds > sslRenewalThresholdDays * 86400 )); then
+    if ((remainingSeconds > sslRenewalThresholdDays * 86400)); then
         echoContent green " ---> 证书有效"
         return 0
     fi
@@ -2753,7 +2862,7 @@ renewalTLS() {
         local newNotAfter
         if newNotAfter=$(openssl x509 -in "/etc/v2ray-agent/tls/${domain}.crt" -noout -enddate 2>/dev/null); then
             newNotAfter=${newNotAfter#notAfter=}
-            if newExpiry=$(date +%s -d "${newNotAfter}" 2>/dev/null) && (( newExpiry > currentTime && newExpiry > expiryTime )); then
+            if newExpiry=$(date +%s -d "${newNotAfter}" 2>/dev/null) && ((newExpiry > currentTime && newExpiry > expiryTime)); then
                 renewalSuccess=true
                 echoContent green " ---> 证书续期成功，新到期时间:$(date -d @"${newExpiry}" +"%F %H:%M:%S")"
             fi
@@ -2960,15 +3069,15 @@ updateGeoSite() {
     echo "version:${version}"
     local geoDir="${2:-${configPath}../}"
     local downloadStatus=0
-    local geoTempDir
-    geoTempDir=$(mktemp -d "${TMPDIR:-/tmp}/v2ray-agent-geo.XXXXXX") || return 1
-    if [[ "${release}" == "alpine" ]]; then
-        wget -c -q -P "${geoTempDir}" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${version}/geosite.dat" &&
-            wget -c -q -P "${geoTempDir}" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${version}/geoip.dat" || downloadStatus=1
-    else
-        wget -c -q "${wgetShowProgressStatus}" -P "${geoTempDir}" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${version}/geosite.dat" &&
-            wget -c -q "${wgetShowProgressStatus}" -P "${geoTempDir}" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${version}/geoip.dat" || downloadStatus=1
+    local -a wgetArgs=(-c -q)
+    if [[ "${release}" != "alpine" && -n "${wgetShowProgressStatus}" ]]; then
+        wgetArgs+=("${wgetShowProgressStatus}")
     fi
+    local geoTempDir
+    mkdir -p "${geoDir}" || return 1
+    geoTempDir=$(mktemp -d "${geoDir}.geo.XXXXXX") || return 1
+    wget "${wgetArgs[@]}" -P "${geoTempDir}" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${version}/geosite.dat" &&
+        wget "${wgetArgs[@]}" -P "${geoTempDir}" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${version}/geoip.dat" || downloadStatus=1
     if [[ "${downloadStatus}" != 0 || ! -s "${geoTempDir}/geosite.dat" || ! -s "${geoTempDir}/geoip.dat" ]]; then
         rm -rf "${geoTempDir}"
         echoContent red " ---> GeoSite/GeoIP下载失败，保留当前文件"
@@ -3143,7 +3252,8 @@ LimitNOFILE=infinity
 WantedBy=multi-user.target
 EOF
         [[ $? == 0 ]] || return 1
-        if [[ "$2" == defer ]]; then systemctl daemon-reload || return 1
+        if [[ "$2" == defer ]]; then
+            systemctl daemon-reload || return 1
         else bootStartup "sing-box.service"; fi
     elif [[ "${release}" == "alpine" ]]; then
         installAlpineStartup "sing-box" || return 1
@@ -3224,14 +3334,14 @@ handleHysteria() {
 handleSingBox() {
     if [[ -f "/etc/systemd/system/sing-box.service" ]]; then
         if [[ -z $(pgrep -f "sing-box") ]] && [[ "$1" == "start" ]]; then
-            singBoxMergeConfig || return 1
+            if [[ "${3:-}" != staged ]]; then singBoxMergeConfig || return 1; fi
             systemctl start sing-box.service
         elif [[ -n $(pgrep -f "sing-box") ]] && [[ "$1" == "stop" ]]; then
             systemctl stop sing-box.service
         fi
     elif [[ -f "/etc/init.d/sing-box" ]]; then
         if [[ -z $(pgrep -f "sing-box") ]] && [[ "$1" == "start" ]]; then
-            singBoxMergeConfig || return 1
+            if [[ "${3:-}" != staged ]]; then singBoxMergeConfig || return 1; fi
             rc-service sing-box start
         elif [[ -n $(pgrep -f "sing-box") ]] && [[ "$1" == "stop" ]]; then
             rc-service sing-box stop
@@ -3264,7 +3374,8 @@ handleSingBox() {
 
 # 操作xray
 handleXray() {
-    if [[ "$1" == start ]]; then
+    # SOCKS5 transactions already validated and published Xray fragments.
+    if [[ "$1" == start && "${3:-}" != staged ]]; then
         socks5OutboundRefreshXray || return 1
     fi
     if [[ -n $(find /bin /usr/bin -name "systemctl") ]] && [[ -n $(find /etc/systemd/system/ -name "xray.service") ]]; then
@@ -3503,6 +3614,7 @@ initHysteriaPort() {
     fi
 
     if [[ -z "${hysteriaPort}" ]]; then
+        echo
         echoContent yellow "请输入Hysteria端口[回车随机10000-30000]，不可与其他服务重复"
         read -r -p "端口:" hysteriaPort
         if [[ -z "${hysteriaPort}" ]]; then
@@ -3633,7 +3745,7 @@ readPortHopping() {
 }
 
 installPortHoppingService() {
-    cat > /etc/v2ray-agent/port-hopping/restore.sh <<'RESTORE' || return 1
+    cat >/etc/v2ray-agent/port-hopping/restore.sh <<'RESTORE' || return 1
 #!/bin/sh
 set -e
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -3649,7 +3761,7 @@ done
 RESTORE
     chmod 700 /etc/v2ray-agent/port-hopping/restore.sh || return 1
     if [[ "${release}" == alpine ]]; then
-        cat > /etc/init.d/v2ray-agent-port-hopping <<'OPENRC' || return 1
+        cat >/etc/init.d/v2ray-agent-port-hopping <<'OPENRC' || return 1
 #!/sbin/openrc-run
 description="Restore v2ray-agent port hopping"
 depend() {
@@ -3663,7 +3775,7 @@ start() {
 OPENRC
         chmod 700 /etc/init.d/v2ray-agent-port-hopping && rc-update add v2ray-agent-port-hopping default
     else
-        cat > /etc/systemd/system/v2ray-agent-port-hopping.service <<'SYSTEMD' || return 1
+        cat >/etc/systemd/system/v2ray-agent-port-hopping.service <<'SYSTEMD' || return 1
 [Unit]
 Description=Restore v2ray-agent port hopping
 After=network-pre.target nftables.service netfilter-persistent.service ufw.service
@@ -3724,7 +3836,10 @@ changeFirewalldPortHopping() {
 createPortHoppingRules() {
     local type=$1 start=$2 end=$3 targetPort=$4 interval=${5:-60}
     validPortHoppingConfig "${type}" "${start}" "${end}" "${targetPort}" "${interval}" || return 1
-    start=$((10#${start})); end=$((10#${end})); targetPort=$((10#${targetPort})); interval=$((10#${interval}))
+    start=$((10#${start}))
+    end=$((10#${end}))
+    targetPort=$((10#${targetPort}))
+    interval=$((10#${interval}))
     local hoppingBackend hoppingStart hoppingEnd hoppingTarget hoppingInterval hoppingFamilies hoppingZone
     [[ ! -e "/etc/v2ray-agent/port-hopping/${type}.json" ]] || return 1
     if loadPortHoppingConfig "${type}" "${targetPort}"; then
@@ -3733,7 +3848,7 @@ createPortHoppingRules() {
     local otherType=tuic otherTarget=${singBoxTuicPort} otherRange
     if [[ "${type}" == tuic ]]; then
         otherType=hysteria2
-        otherTarget=${singBoxHysteria2Port:-${xrayHysteria2Port}}
+        otherTarget=${xrayHysteria2Port:-${singBoxHysteria2Port}}
     fi
     otherRange=$(loadPortHoppingConfig "${otherType}" "${otherTarget}" && echo "${hoppingStart} ${hoppingEnd}")
     if [[ -n "${otherRange}" ]]; then
@@ -3752,7 +3867,7 @@ createPortHoppingRules() {
             return 1
         fi
         extension=nft
-        if ! cat > "${file}.nft.tmp" <<NFT
+        if ! cat >"${file}.nft.tmp" <<NFT; then
 table inet v2ray_agent_${type} {
     chain prerouting {
         type nat hook prerouting priority dstnat; policy accept;
@@ -3760,7 +3875,7 @@ table inet v2ray_agent_${type} {
     }
 }
 NFT
-        then
+
             rm -f "${file}.nft.tmp"
             return 1
         fi
@@ -3775,7 +3890,7 @@ NFT
             families=4,6
         fi
         extension=iptables
-        if ! cat > "${file}.iptables.tmp" <<IPTABLES
+        if ! cat >"${file}.iptables.tmp" <<IPTABLES; then
 #!/bin/sh
 set -e
 HOPPING_ACTION=\${1:-add}
@@ -3789,7 +3904,7 @@ for tool in iptables $([[ "${families}" != 4,6 ]] || echo ip6tables); do
     fi
 done
 IPTABLES
-        then
+
             rm -f "${file}.iptables.tmp"
             return 1
         fi
@@ -3803,7 +3918,7 @@ IPTABLES
     # Publish ownership before changing the firewall, so failed rollback is retryable.
     if ! jq -n --arg backend "${backend}" --arg zone "${zone}" --arg families "${families}" \
         --argjson start "${start}" --argjson endPort "${end}" --argjson target "${targetPort}" --argjson interval "${interval}" \
-        '{backend:$backend,start:$start,end:$endPort,target:$target,interval:$interval,zone:$zone,families:$families}' > "${file}.json.tmp" ||
+        '{backend:$backend,start:$start,end:$endPort,target:$target,interval:$interval,zone:$zone,families:$families}' >"${file}.json.tmp" ||
         ! mv "${file}.json.tmp" "${file}.json"; then
         rm -f "${file}.json.tmp" "${file}.nft.tmp" "${file}.iptables.tmp"
         return 1
@@ -3887,7 +4002,7 @@ deletePortHoppingRules() {
         firewalld)
             changeFirewalldPortHopping delete "${hoppingZone}" "${hoppingStart}" "${hoppingEnd}" "${hoppingTarget}" || return 1
             ;;
-        legacy-iptables|legacy-firewalld)
+        legacy-iptables | legacy-firewalld)
             deleteLegacyPortHopping "${type}" "${hoppingTarget}" "${hoppingBackend}" "${hoppingStart}" "${hoppingEnd}" || return 1
             ;;
         esac
@@ -3899,7 +4014,7 @@ deletePortHoppingRules() {
             mkdir -p /etc/v2ray-agent/port-hopping && chmod 700 /etc/v2ray-agent/port-hopping || return 1
             jq -n --arg backend "${hoppingBackend}" --arg zone "${hoppingZone}" \
                 --argjson start "${hoppingStart}" --argjson endPort "${hoppingEnd}" --argjson target "${hoppingTarget}" \
-                '{backend:$backend,start:$start,end:$endPort,target:$target,interval:60,zone:$zone,families:"4"}' > "${file}.json.tmp" &&
+                '{backend:$backend,start:$start,end:$endPort,target:$target,interval:60,zone:$zone,families:"4"}' >"${file}.json.tmp" &&
                 mv "${file}.json.tmp" "${file}.json" || return 1
             deletePortHoppingRules "${type}" '' '' "${targetPort}"
             return $?
@@ -3909,13 +4024,13 @@ deletePortHoppingRules() {
 }
 
 removeAllPortHopping() {
-    deletePortHoppingRules hysteria2 '' '' "${singBoxHysteria2Port:-${xrayHysteria2Port}}" &&
+    deletePortHoppingRules hysteria2 '' '' "${xrayHysteria2Port:-${singBoxHysteria2Port}}" &&
         deletePortHoppingRules tuic '' '' "${singBoxTuicPort}"
 }
 
 buildSingBoxHysteria2Node() {
     local port=$1 email=$2 password=$3
-    local listenPort=${singBoxHysteria2Port:-${xrayHysteria2Port}}
+    local listenPort=${hysteriaPort}
     jq -n --arg port "${port}" --arg tag "${email}" --arg password "${password}" --arg host "${currentHost}" \
         --argjson listenPort "${listenPort}" --argjson up "${hysteria2ClientUploadSpeed}" \
         --argjson down "${hysteria2ClientDownloadSpeed}" --arg interval "${hysteria2HopInterval:-60}s" \
@@ -3966,7 +4081,10 @@ addPortHopping() {
 portHoppingMenu() {
     local type=$1 targetPort selectPortHoppingStatus
     case "${type}" in
-    hysteria2) targetPort=${singBoxHysteria2Port:-${xrayHysteria2Port}} ;;
+    hysteria2)
+        readSingBoxConfig || return 1
+        targetPort=${hysteriaPort}
+        ;;
     tuic) targetPort=${singBoxTuicPort} ;;
     *) return 1 ;;
     esac
@@ -4004,6 +4122,7 @@ portHoppingMenu() {
 }
 
 manageHysteriaPortHopping() {
+    if [[ "${webBackend:-}" == onepanel ]]; then echoContent yellow "1Panel 后端目前管理 Xray 协议；Hysteria2/TUIC 请使用独立模式"; return 0; fi
     readInstallType
     readInstallProtocolType
     if ! echo "${currentInstallProtocolType}" | grep -q ',6,'; then
@@ -4494,7 +4613,7 @@ EOF
 
 # sing-box Tuic安装
 singBoxTuicInstall() {
-    if ! echo "${currentInstallProtocolType}" | grep -qE ",0,|,1,|,2,|,3,|,4,|,5,|,6,|,9,|,10,"; then
+    if ! echo "${currentInstallProtocolType}" | grep -qE ",0,|,1,|,2,|,3,|,4,|,5,|,6,|,9,|,10,|,13,|,14,"; then
         echoContent red "\n ---> 由于需要依赖证书，如安装Tuic，请先安装带有TLS标识协议"
         exit 0
     fi
@@ -4503,14 +4622,14 @@ singBoxTuicInstall() {
     installSingBox 1 || return 1
     selectCustomInstallType=",9,"
     initSingBoxConfig custom 2 true || return 1
-    installSingBoxService 3
+    installSingBoxService 3 || return 1
     reloadCore
     showAccounts 4
 }
 
 # sing-box hy2安装
 singBoxHysteria2Install() {
-    if ! echo "${currentInstallProtocolType}" | grep -qE ",0,|,1,|,2,|,3,|,4,|,5,|,6,|,9,|,10,"; then
+    if ! echo "${currentInstallProtocolType}" | grep -qE ",0,|,1,|,2,|,3,|,4,|,5,|,6,|,9,|,10,|,13,|,14,"; then
         echoContent red "\n ---> 由于需要依赖证书，如安装Hysteria2，请先安装带有TLS标识协议"
         exit 0
     fi
@@ -4519,7 +4638,7 @@ singBoxHysteria2Install() {
     installSingBox 1 || return 1
     selectCustomInstallType=",6,"
     initSingBoxConfig custom 2 true || return 1
-    installSingBoxService 3
+    installSingBoxService 3 || return 1
     reloadCore
     showAccounts 4
 }
@@ -4599,6 +4718,10 @@ singBoxMergeConfig() (
         socks5OutboundPrepareSingBoxMerged "${tmpDir}/config.json" "${tmpDir}" &&
         /etc/v2ray-agent/sing-box/sing-box check -c "${tmpDir}/config.json" -D "${configDir}/" >/dev/null 2>&1 &&
         chmod 600 "${tmpDir}/config.json" && mv -f "${tmpDir}/config.json" "${configDir}/config.json"
+    local result=$?
+    # Rollback can call this function from an EXIT trap; clean up explicitly there too.
+    rm -rf "${tmpDir}"
+    return "${result}"
 )
 
 # 初始化Xray Trojan XTLS 配置文件
@@ -4933,12 +5056,14 @@ EOF
     if echo "${selectCustomInstallType}" | grep -q ",6,"; then
         initHysteriaPort
         initHysteria2Network
+        saveXrayHysteria2Network || return 1
         cat <<EOF >/etc/v2ray-agent/xray/conf/06_hysteria2_inbounds.json
 {
   "inbounds": [{
     "listen": "::",
     "port": ${hysteriaPort},
     "protocol": "hysteria",
+    "tag":"hysteria",
     "settings": {
       "version": 2,
       "users": $(initXrayClients 6)
@@ -4950,13 +5075,20 @@ EOF
         "serverName": "${domain:-${currentHost}}",
         "certificates": [{"certificateFile": "/etc/v2ray-agent/tls/${domain:-${currentHost}}.crt", "keyFile": "/etc/v2ray-agent/tls/${domain:-${currentHost}}.key"}]
       },
-      "hysteriaSettings": {"version": 2}
+      "hysteriaSettings": {
+        "version": 2,
+        "masquerade": {
+          "type": "file",
+          "dir": "${nginxStaticPath}"
+        }
+      }
     }
   }]
 }
 EOF
     elif [[ -z "$3" ]]; then
         rm -f /etc/v2ray-agent/xray/conf/06_hysteria2_inbounds.json
+        rm -f /etc/v2ray-agent/xray/hysteria2_network.json
     fi
 
     if echo "${selectCustomInstallType}" | grep -q ",3," || [[ "$1" == "all" ]]; then
@@ -5183,7 +5315,7 @@ EOF
     if [[ -z "$3" ]]; then
         removeXrayOutbound wireguard_out_IPv4_route
         removeXrayOutbound wireguard_out_IPv6_route
-        removeXrayOutbound  wireguard_outbound
+        removeXrayOutbound wireguard_outbound
         removeXrayOutbound IPv4_out
         removeXrayOutbound IPv6_out
         removeXrayOutbound socks5_outbound
@@ -5945,6 +6077,8 @@ EOF
         local clashMetaPortContent="port: ${port}"
         local multiPort=
         local multiPortEncode
+        local speedParams="upmbps=${hysteria2ClientUploadSpeed}&downmbps=${hysteria2ClientDownloadSpeed}&"
+        local speedParamsEncode="upmbps%3D${hysteria2ClientUploadSpeed}%26downmbps%3D${hysteria2ClientDownloadSpeed}%26"
         if echo "${port}" | grep -q "-"; then
             clashMetaPortContent="ports: \"${port}\"
     hop-interval: ${hysteria2HopInterval:-60}"
@@ -5952,9 +6086,9 @@ EOF
             multiPortEncode="mport%3D${port}%26"
         fi
 
-        echoContent green "    hysteria2://${id}@${currentHost}:${port}?${multiPort}peer=${currentHost}&insecure=0&sni=${currentHost}&alpn=h3#${email}\n"
+        echoContent green "    hysteria2://${id}@${currentHost}:${port}?${multiPort}${speedParams}peer=${currentHost}&insecure=0&sni=${currentHost}&alpn=h3#${email}\n"
         cat <<EOF >>"${outputRoot}/default/${user}" || return 1
-hysteria2://${id}@${currentHost}:${port}?${multiPort}peer=${currentHost}&insecure=0&sni=${currentHost}&alpn=h3#${email}
+hysteria2://${id}@${currentHost}:${port}?${multiPort}${speedParams}peer=${currentHost}&insecure=0&sni=${currentHost}&alpn=h3#${email}
 EOF
         echoContent yellow " ---> v2rayN(hysteria+TLS)"
         jq -n --arg server "${currentHost}:${port}" --arg password "${id}" --arg host "${currentHost}" \
@@ -5981,7 +6115,7 @@ EOF
         echo "${singBoxSubscribeLocalConfig}" | jq . >"${outputRoot}/sing-box/${user}" || return 1
 
         echoContent yellow " ---> 二维码 Hysteria2(TLS)"
-        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=hysteria2%3A%2F%2F${id}%40${currentHost}%3A${port}%3F${multiPortEncode}peer%3D${currentHost}%26insecure%3D0%26sni%3D${currentHost}%26alpn%3Dh3%23${email}\n"
+        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=hysteria2%3A%2F%2F${id}%40${currentHost}%3A${port}%3F${multiPortEncode}${speedParamsEncode}peer%3D${currentHost}%26insecure%3D0%26sni%3D${currentHost}%26alpn%3Dh3%23${email}\n"
 
     elif [[ "${type}" == "vlessReality" ]]; then
         local realityServerName=${xrayVLESSRealityServerName}
@@ -6258,13 +6392,16 @@ collectAccountUsers() {
 selectAccountUser() {
     local users=$1 count index selected
     count=$(jq 'length' <<<"${users}") || return 1
-    ((count > 0)) || { echoContent yellow " ---> 没有可查看的用户"; return 2; }
+    ((count > 0)) || {
+        echoContent yellow " ---> 没有可查看的用户"
+        return 2
+    }
     while :; do
         echoContent skyBlue "\n请选择要查看的用户:"
         jq -r 'to_entries[] | "\(.key + 1).\(.value.key)"' <<<"${users}"
         read -r -p "请输入:" selected || return 2
         case "${selected}" in
-        ''|*[!0-9]*) echoContent red " ---> 选择无效，请重试" ;;
+        '' | *[!0-9]*) echoContent red " ---> 选择无效，请重试" ;;
         *)
             index=$((10#${selected}))
             if ((index >= 1 && index <= count)); then
@@ -6293,7 +6430,7 @@ showAccounts() {
     readInstallType
     readInstallProtocolType
     readConfigHostPathUUID
-    readSingBoxConfig
+    readSingBoxConfig || return 1
 
     echo
     echoContent skyBlue "\n进度 $1/${totalProgress} : 账号"
@@ -6448,19 +6585,19 @@ showAccounts() {
     fi
     # hysteria2
     if echo ${currentInstallProtocolType} | grep -q ",6," || [[ -n "${hysteriaPort}" ]]; then
-        readPortHopping "hysteria2" "${singBoxHysteria2Port:-${xrayHysteria2Port}}"
+        readPortHopping "hysteria2" "${hysteriaPort}"
         echoContent skyBlue "\n================================  Hysteria2 TLS [推荐] ================================\n"
         local hysteriaConfigPath="${configPath}"
-        [[ "${coreInstallType}" != "2" ]] || hysteriaConfigPath="${singBoxConfigPath}"
+        [[ -f "${hysteriaConfigPath}06_hysteria2_inbounds.json" && "${coreInstallType}" == "1" ]] || hysteriaConfigPath="${singBoxConfigPath}"
         local hysteria2DefaultPort=
         if [[ -n "${hysteria2PortHoppingStart}" && -n "${hysteria2PortHoppingEnd}" ]]; then
             hysteria2DefaultPort="${hysteria2PortHopping}"
         else
-            hysteria2DefaultPort=${singBoxHysteria2Port:-${xrayHysteria2Port}}
+            hysteria2DefaultPort=${hysteriaPort}
         fi
 
         local hysteriaUsersFilter='.inbounds[]|.settings.users[]'
-        [[ "${coreInstallType}" != "2" ]] || hysteriaUsersFilter='.inbounds[]|.users[]'
+        [[ "${hysteriaConfigPath}" != "${singBoxConfigPath}" ]] || hysteriaUsersFilter='.inbounds[]|.users[]'
         accountUsers=$(readAccountUsers "${hysteriaUsersFilter}" "${hysteriaConfigPath}06_hysteria2_inbounds.json") || return 1
         while IFS= read -r user; do
             [[ -n "${user}" ]] || continue
@@ -6819,11 +6956,11 @@ addCorePort() {
         [[ "${newPort}" =~ ^[0-9]+(,[0-9]+)*$ ]] || return 1
         while IFS= read -r validatedPort; do
             [[ "${validatedPort}" =~ ^[0-9]{1,5}$ ]] &&
-                (( 10#${validatedPort} >= 1 && 10#${validatedPort} <= 65535 )) || return 1
+                ((10#${validatedPort} >= 1 && 10#${validatedPort} <= 65535)) || return 1
         done < <(printf '%s\n' "${newPort}" | tr ',' '\n')
         if [[ -n "${defaultPort}" ]]; then
             [[ "${defaultPort}" =~ ^[0-9]{1,5}$ ]] &&
-                (( 10#${defaultPort} >= 1 && 10#${defaultPort} <= 65535 )) || return 1
+                ((10#${defaultPort} >= 1 && 10#${defaultPort} <= 65535)) || return 1
             defaultPort=$((10#${defaultPort}))
             find "${configPath}" -maxdepth 1 -type f -name '02_dokodemodoor_inbounds_*_default.json' -delete
         fi
@@ -6943,31 +7080,14 @@ unInstall() {
     if ! isNginxRunning; then
         echoContent green " ---> 停止Nginx成功"
     fi
-    if [[ "${release}" == "alpine" ]]; then
-        if [[ "${coreInstallType}" == "1" ]]; then
-            handleXray stop
-            rc-update del xray default
-            rm -rf /etc/init.d/xray
-            echoContent green " ---> 删除Xray开机自启完成"
-        fi
-        if [[ "${coreInstallType}" == "2" || -n "${singBoxConfigPath}" ]]; then
-            handleSingBox stop
-            rc-update del sing-box default
-            rm -rf /etc/init.d/sing-box
-            echoContent green " ---> 删除sing-box开机自启完成"
-        fi
-    else
-        if [[ "${coreInstallType}" == "1" ]]; then
-            handleXray stop
-            rm -rf /etc/systemd/system/xray.service
-            echoContent green " ---> 删除Xray开机自启完成"
-        fi
-        if [[ "${coreInstallType}" == "2" || -n "${singBoxConfigPath}" ]]; then
-            handleSingBox stop
-            rm -rf /etc/systemd/system/sing-box.service
-            echoContent green " ---> 删除sing-box开机自启完成"
-        fi
-    fi
+    removeCoreService xray || {
+        echoContent red " ---> Xray service清理失败，已停止卸载"
+        return 1
+    }
+    removeCoreService sing-box || {
+        echoContent red " ---> sing-box service清理失败，已停止卸载"
+        return 1
+    }
 
     rm -rf /etc/v2ray-agent
     rm -rf ${nginxConfigPath}alone.conf
@@ -7361,6 +7481,13 @@ removeUser() {
         fi
     fi
 
+    if [[ -n "${delUserIndex}" && "${coreInstallType}" == 2 ]]; then
+        local userFile
+        for userFile in "${configPath}"*_inbounds.json; do
+            [[ -f "$userFile" ]] || continue
+            socks5OutboundCheckUserRemoval sing-box "$userFile" index "$delUserIndex" || return 1
+        done
+    fi
     if [[ -n "${delUserIndex}" ]]; then
 
         if [[ "${coreInstallType}" != "1" ]] && echo ${currentInstallProtocolType} | grep -q ",0,"; then
@@ -8605,7 +8732,7 @@ routingToolsMenu() {
     echoContent yellow "1.WARP分流【第三方 IPv4】"
     echoContent yellow "2.WARP分流【第三方 IPv6】"
     echoContent yellow "3.IPv6分流"
-    echoContent yellow "4.Socks5分流【替换任意门分流】"
+    echoContent yellow "4.Socks5分流【落地机分流】"
     echoContent yellow "5.DNS分流"
     #    echoContent yellow "6.VMess+WS+TLS分流"
     echoContent yellow "7.SNI反向代理分流"
@@ -8667,14 +8794,19 @@ vmessWSRouting() {
 # Socks5分流
 # SOCKS5 inbound setup never upgrades an installed core.
 installSocks5InboundTools() {
-    [[ "$(id -u)" == 0 ]] || { echoContent red ' ---> 需要 root 权限'; return 1; }
+    [[ "$(id -u)" == 0 ]] || {
+        echoContent red ' ---> 需要 root 权限'
+        return 1
+    }
     if [[ "${release}" == alpine ]]; then
         command -v rc-service >/dev/null && command -v rc-update >/dev/null && [[ -d /run/openrc ]] || {
-            echoContent red ' ---> OpenRC 不可用'; return 1;
+            echoContent red ' ---> OpenRC 不可用'
+            return 1
         }
     else
         command -v systemctl >/dev/null && [[ -d /run/systemd/system ]] || {
-            echoContent red ' ---> 需要正在运行的 systemd'; return 1;
+            echoContent red ' ---> 需要正在运行的 systemd'
+            return 1
         }
     fi
     local tool package
@@ -8721,7 +8853,7 @@ socks5SingBoxService() {
         enable) rc-update add sing-box default ;;
         disable) rc-update del sing-box default ;;
         pid) cat /var/run/sing-box.pid 2>/dev/null ;;
-        status|start|stop) rc-service sing-box "${action}" ;;
+        status | start | stop) rc-service sing-box "${action}" ;;
         remove) rm -f /etc/init.d/sing-box ;;
         esac
     else
@@ -8729,7 +8861,7 @@ socks5SingBoxService() {
         exists) [[ -e /etc/systemd/system/sing-box.service || -L /etc/systemd/system/sing-box.service ]] || systemctl cat sing-box.service >/dev/null 2>&1 ;;
         status) systemctl is-active --quiet sing-box.service ;;
         enabled) systemctl is-enabled --quiet sing-box.service ;;
-        enable|disable|start|stop) systemctl "${action}" sing-box.service ;;
+        enable | disable | start | stop) systemctl "${action}" sing-box.service ;;
         pid) systemctl show -p MainPID --value sing-box.service ;;
         remove) rm -f /etc/systemd/system/sing-box.service && systemctl daemon-reload ;;
         esac
@@ -8746,7 +8878,7 @@ socks5InboundFirewall() {
             ufw) ufw --force delete allow "${rulePort}/tcp" || return 1 ;;
             firewalld-runtime) firewall-cmd --zone=public --remove-port="${rulePort}/tcp" || return 1 ;;
             firewalld-permanent) firewall-cmd --zone=public --remove-port="${rulePort}/tcp" --permanent || return 1 ;;
-            iptables|ip6tables)
+            iptables | ip6tables)
                 "${backend}" -C INPUT -p tcp --dport "${rulePort}" -m comment --comment v2ray-agent-socks5 -j ACCEPT 2>/dev/null || continue
                 "${backend}" -D INPUT -p tcp --dport "${rulePort}" -m comment --comment v2ray-agent-socks5 -j ACCEPT || return 1
                 netfilter-persistent save || return 1
@@ -8851,7 +8983,8 @@ generateSocks5InboundConfig() {
         [[ ! -e "${target}/00_socks5_dns.json" ]] || return 1
         jq -n '{dns:{servers:[{type:"local",tag:"local"}]}}' >"${target}/00_socks5_dns.json" || return 1
     elif ! jq -e '[.[]|.dns.servers[]?|select(.tag=="local")]|length==1 and (.[0].type=="local" or .[0].address=="local") and (.[0].detour // "")==""' <<<"${merged}" >/dev/null; then
-        echoContent red ' ---> local DNS 标签与本功能不兼容'; return 1
+        echoContent red ' ---> local DNS 标签与本功能不兼容'
+        return 1
     fi
     if [[ "${domains}" != '*' ]]; then
         while IFS= read -r domain; do
@@ -8865,7 +8998,10 @@ generateSocks5InboundConfig() {
                 rule=$(jq -n --arg d "${domain}" '{domain_suffix:[$d]}') || return 1
             else
                 name=$(getDLCGeositeName "${domain}" /etc/v2ray-agent/sing-box)
-                [[ -n "${name}" ]] || { echoContent red " ---> 未知域名或规则集： ${domain}"; return 1; }
+                [[ -n "${name}" ]] || {
+                    echoContent red " ---> 未知域名或规则集： ${domain}"
+                    return 1
+                }
             fi
             if [[ -n "${name}" ]]; then
                 sets=$(jq --arg n "${name}" '. + [{type:"remote",tag:("socks5_"+$n),format:"binary",url:("https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-"+$n+".srs"),http_client:"rule_set_http"}] | unique_by(.tag)' <<<"${sets}") || return 1
@@ -8882,7 +9018,8 @@ generateSocks5InboundConfig() {
             client=$(jq -n '{http_clients:[{tag:"rule_set_http"}]}') || return 1
             printf '%s\n' "${client}" >"${target}/00_socks5_http.json" || return 1
         elif ! jq -e '[.[]|.http_clients[]?|select(.tag=="rule_set_http")]|length==1 and (.[0].detour // "")==""' <<<"${merged}" >/dev/null; then
-            echoContent red ' ---> rule_set_http 标签与本功能不兼容'; return 1
+            echoContent red ' ---> rule_set_http 标签与本功能不兼容'
+            return 1
         fi
     fi
     rules=$(jq -n --argjson sources "${sources}" --arg strategy "${strategy}" --argjson allow "${allow}" '
@@ -8982,7 +9119,10 @@ commitSocks5Inbound() (
     if [[ "${mode}" == remove ]]; then
         rm -f "${candidate}/20_socks5_inbounds.json" "${candidate}/00_socks5_guard.json"
     else
-        socks5PortAvailable "${port}" || { echoContent red ' ---> 端口无效或已被占用'; return 1; }
+        socks5PortAvailable "${port}" || {
+            echoContent red ' ---> 端口无效或已被占用'
+            return 1
+        }
         # Empty directories need a base object for jq -s and sing-box merge.
         [[ -n "$(find "${candidate}" -name '*.json' -print -quit)" ]] || printf '{}\n' >"${candidate}/00_socks5_base.json"
         generateSocks5InboundConfig "${candidate}" "${port}" "${credential}" "${sources}" "${strategy}" "${domains}" "${listen}" || return 1
@@ -9002,11 +9142,13 @@ commitSocks5Inbound() (
         if [[ "${release}" == alpine ]]; then
             grep -Fxq 'command="/etc/v2ray-agent/sing-box/sing-box"' /etc/init.d/sing-box &&
                 grep -Fxq 'command_args="run -c /etc/v2ray-agent/sing-box/conf/config.json"' /etc/init.d/sing-box || {
-                    echoContent red ' ---> 已有服务使用不同的启动命令或配置路径'; return 1;
-                }
+                echoContent red ' ---> 已有服务使用不同的启动命令或配置路径'
+                return 1
+            }
         else
             systemctl show -p ExecStart --value sing-box.service | grep -Fq 'argv[]=/etc/v2ray-agent/sing-box/sing-box run -c /etc/v2ray-agent/sing-box/conf/config.json ;' || {
-                echoContent red ' ---> 已有服务使用不同的启动命令或配置路径'; return 1;
+                echoContent red ' ---> 已有服务使用不同的启动命令或配置路径'
+                return 1
             }
         fi
     fi
@@ -9043,31 +9185,68 @@ commitSocks5Inbound() (
     fi
     success=true
     if [[ "${mode}" == remove && -f "${root}/socks5-firewall" ]]; then
-        if socks5InboundFirewall remove '' "${root}/socks5-firewall"; then rm -f "${root}/socks5-firewall"
-        else echoContent yellow ' ---> 入站已卸载，部分托管防火墙规则清理失败'; return 1; fi
+        if socks5InboundFirewall remove '' "${root}/socks5-firewall"; then
+            rm -f "${root}/socks5-firewall"
+        else
+            echoContent yellow ' ---> 入站已卸载，部分托管防火墙规则清理失败'
+            return 1
+        fi
     fi
 )
+
+# Export only connection fields; wildcard listen addresses are not remote endpoints.
+socks5InboundShareConfig() {
+    local inbound=${1:-/etc/v2ray-agent/sing-box/conf/config/20_socks5_inbounds.json} server
+    server=$(jq -er '.inbounds[0].listen' "$inbound") || return 1
+    case "$server" in '::' | '0.0.0.0' | '') server=$(getPublicIP) ;; esac
+    if [[ -z "$server" ]]; then
+        socks5OutboundText '未获取到公网地址，请在出站手动填写地址、端口和账号密码' 'Public address unavailable; enter the address, port and credentials manually'
+        return 0
+    fi
+    echo
+    socks5OutboundText '复制下一整行，在添加出站的地址处粘贴（包含账号密码）：' 'Copy the entire next line into the outbound address prompt (includes credentials):'
+    echo
+    jq -c --arg server "$server" '.inbounds[0] |
+      {server:$server,server_port:.listen_port,username:(.users[0].username // ""),password:(.users[0].password // "")}' "$inbound"
+}
 
 installSocks5InboundStandalone() {
     local port credential strategy sources domains allowAll listen
     echoContent skyBlue ' ---> SOCKS5 入站（sing-box）'
+    echo
     read -r -p '监听地址 [默认 ::]: ' listen || return 1
     listen=${listen:-::}
+    echo
     read -r -p '端口 [默认随机]: ' port || return 1
     port=${port:-$((RANDOM % 50001 + 10000))}
     [[ "${port}" =~ ^[0-9]{1,5}$ ]] && ((10#${port} >= 1 && 10#${port} <= 65535)) || return 1
     port=$((10#${port}))
+    echo
     read -r -p '用户名/密码 UUID [默认随机]: ' credential || return 1
+    echo
     read -r -p 'DNS 解析策略 [1=IPv4，2=IPv6，默认 1]: ' strategy || return 1
-    case "${strategy}" in ''|1) strategy=ipv4_only ;; 2) strategy=ipv6_only ;; *) return 1 ;; esac
-    read -r -p '允许的来源 IP/CIDR（逗号分隔）: ' sources || return 1
-    [[ -n "${sources}" ]] || return 1
+    case "${strategy}" in '' | 1) strategy=ipv4_only ;; 2) strategy=ipv6_only ;; *) return 1 ;; esac
+    while true; do
+        echo
+        read -r -p '允许的来源 IP/CIDR（逗号分隔）: ' sources || return 1
+        [[ -n "${sources//[[:space:]]/}" ]] && break
+        echoContent yellow ' ---> 来源 IP/CIDR 不能为空，请重新输入'
+    done
+    echo
     read -r -p '是否允许所有目标？[y/n]: ' allowAll || return 1
-    case "${allowAll}" in y|Y) domains='*' ;; n|N) read -r -p '域名或规则集（逗号分隔）: ' domains || return 1; [[ -n "${domains}" ]] || return 1 ;; *) return 1 ;; esac
+    case "${allowAll}" in y | Y) domains='*' ;; n | N)
+        echo
+        read -r -p '域名或规则集（逗号分隔）: ' domains || return 1
+        [[ -n "${domains}" ]] || return 1
+        ;;
+    *) return 1 ;; esac
     installSocks5InboundTools || return 1
     sources=$(normalizeSocks5Sources "${sources}") || return 1
     # Check before download as well as immediately before publishing.
-    socks5PortAvailable "${port}" || { echoContent red ' ---> 端口无效或已被占用'; return 1; }
+    socks5PortAvailable "${port}" || {
+        echoContent red ' ---> 端口无效或已被占用'
+        return 1
+    }
     prepareSingBoxCoreForSocks5 || return 1
     if ! commitSocks5Inbound install "${port}" "${credential}" "${sources}" "${strategy}" "${domains}" "${listen}"; then
         echoContent red ' ---> SOCKS5 安装失败，请查看上方错误'
@@ -9075,21 +9254,32 @@ installSocks5InboundStandalone() {
     fi
     readInstallType
     readInstallProtocolType
+    echo
     echoContent green ' ---> SOCKS5 入站安装成功'
     jq '{listen:.inbounds[0].listen,port:.inbounds[0].listen_port,users:.inbounds[0].users}' /etc/v2ray-agent/sing-box/conf/config/20_socks5_inbounds.json
+    socks5InboundShareConfig
 }
 
 updateSocks5InboundRules() {
     local inbound=/etc/v2ray-agent/sing-box/conf/config/20_socks5_inbounds.json
     [[ -f "${inbound}" && -f /etc/v2ray-agent/sing-box/conf/config/00_socks5_guard.json ]] || {
-        echoContent red ' ---> 未安装本版本 SOCKS5 入站 '; return 1;
+        echoContent red ' ---> 未安装本版本 SOCKS5 入站 '
+        return 1
     }
     # Reuse the same transaction; the existing inbound is never regenerated from defaults.
     local sources domains allowAll strategy
-    read -r -p '允许的来源 IP/CIDR（逗号分隔）: ' sources || return 1
+    while true; do
+        read -r -p '允许的来源 IP/CIDR（逗号分隔）: ' sources || return 1
+        [[ -n "${sources//[[:space:]]/}" ]] && break
+        echoContent yellow ' ---> 来源 IP/CIDR 不能为空，请重新输入'
+    done
     sources=$(normalizeSocks5Sources "${sources}") || return 1
     read -r -p '是否允许所有目标？[y/n]: ' allowAll || return 1
-    case "${allowAll}" in y|Y) domains='*' ;; n|N) read -r -p '域名或规则集（逗号分隔）: ' domains || return 1; [[ -n "${domains}" ]] || return 1 ;; *) return 1 ;; esac
+    case "${allowAll}" in y | Y) domains='*' ;; n | N)
+        read -r -p '域名或规则集（逗号分隔）: ' domains || return 1
+        [[ -n "${domains}" ]] || return 1
+        ;;
+    *) return 1 ;; esac
     strategy=$(jq -r '.route.rules[]|select(.action=="resolve")|.strategy' /etc/v2ray-agent/sing-box/conf/config/00_socks5_guard.json) || return 1
     commitSocks5Inbound install "$(jq -r '.inbounds[0].listen_port' "${inbound}")" \
         "$(jq -r '.inbounds[0].users[0].password' "${inbound}")" "${sources}" "${strategy}" "${domains}" "$(jq -r '.inbounds[0].listen' "${inbound}")"
@@ -9104,8 +9294,8 @@ socks5Routing() {
     echoContent yellow "# 仅限正常网络环境下设备间流量转发，禁止用于代理访问。"
     echoContent yellow "# 使用教程：https://www.v2ray-agent.com/archives/1683226921000#heading-5 \n"
 
-    echoContent yellow "1.Socks5出站"
-    echoContent yellow "2.Socks5入站"
+    echoContent yellow "1.连接落地机（SOCKS5 出站）"
+    echoContent yellow "2.搭建落地机（SOCKS5 入站）"
     echoContent yellow "3.卸载"
     read -r -p "请选择:" selectType
 
@@ -9156,6 +9346,7 @@ socks5InboundRoutingMenu() {
             echoContent green " 端口：$(jq .inbounds[0].listen_port /etc/v2ray-agent/sing-box/conf/config/20_socks5_inbounds.json)"
             echoContent green " 用户名称：$(jq -r .inbounds[0].users[0].username /etc/v2ray-agent/sing-box/conf/config/20_socks5_inbounds.json)"
             echoContent green " 用户密码：$(jq -r .inbounds[0].users[0].password /etc/v2ray-agent/sing-box/conf/config/20_socks5_inbounds.json)"
+            socks5InboundShareConfig
         else
             echoContent red " ---> 未安装相应功能"
         fi
@@ -9168,13 +9359,19 @@ socks5InboundRoutingMenu() {
 socks5OutboundLanguage() { printf '%s' cn; }
 
 socks5OutboundText() {
-    if [[ "$(socks5OutboundLanguage)" == en ]]; then printf '%s\n' "$2"
+    if [[ "$(socks5OutboundLanguage)" == en ]]; then
+        printf '%s\n' "$2"
     else printf '%s\n' "$1"; fi
 }
 
 socks5OutboundRead() {
-    local prompt
+    local prompt status=0
     prompt=$(socks5OutboundText "$2" "$3")
+    if [[ "${4:-}" == silent ]]; then
+        read -r -s -p "$prompt " "$1" || status=$?
+        [[ ! -t 0 ]] || printf '\n' >&2
+        return "$status"
+    fi
     read -r -p "$prompt " "$1"
 }
 
@@ -9223,11 +9420,15 @@ socks5OutboundChooseCore() {
     local cores choice
     cores=$(socks5OutboundCores)
     case "$cores" in
-    sing-box|xray) socks5SelectedCore=$cores ;;
-    '') socks5OutboundText '请先安装核心和入站协议' 'Install a core and inbound first'; return 1 ;;
+    sing-box | xray) socks5SelectedCore=$cores ;;
+    '')
+        socks5OutboundText '请先安装核心和入站协议' 'Install a core and inbound first'
+        return 1
+        ;;
     *)
         socks5OutboundRead choice '选择核心 [1=sing-box, 2=Xray]:' 'Core [1=sing-box, 2=Xray]:' || return 1
-        case "$choice" in 1) socks5SelectedCore=sing-box ;; 2) socks5SelectedCore=xray ;; *) return 1 ;; esac ;;
+        case "$choice" in 1) socks5SelectedCore=sing-box ;; 2) socks5SelectedCore=xray ;; *) return 1 ;; esac
+        ;;
     esac
 }
 
@@ -9237,22 +9438,192 @@ socks5OutboundJsonWrite() {
     jq "$@" "$file" >"$file.tmp" && chmod 600 "$file.tmp" && mv -f "$file.tmp" "$file"
 }
 
-# A single jq compiler expands target types to separate rules (OR), retaining inbound conditions.
+# Disk v2 deliberately has no .routes array: older compilers must fail rather than drop user conditions.
+socks5OutboundReadRoutes() {
+    jq -e '
+      if .version==1 and (.routes|type)=="array" and
+         all(.routes[]; (.user_mode // "all")=="all" and ((.user_refs // [])|length)==0) then .
+      elif .version==2 and (.rules|type)=="array" and (has("routes")|not) then
+        .routes=.rules | del(.rules)
+      elif .version==2 and (.routes|type)=="array" and (has("rules")|not) then .
+      else error("Unsupported SOCKS5 route format") end |
+      . as $state |
+      if all(.routes[];
+        ((.user_mode // "all")|IN("all","selected")) and
+        ((.user_refs // [])|type)=="array" and
+        (if (.user_mode // "all")=="selected" then
+          . as $route |
+          $state.version==2 and (.user_refs|length)>0 and .legacy_rule==null and
+          (.inbound_tags|type)=="array" and all(.inbound_tags[];type=="string" and length>0) and
+          ((.user_refs|length)==(.user_refs|unique|length)) and
+          all(.user_refs[]; (keys|sort)==["inbound_tag","user"] and
+            (.inbound_tag|type)=="string" and (.inbound_tag|length)>0 and
+            (.user|type)=="string" and (.user|length)>0 and
+            (.inbound_tag as $tag | ($route.inbound_tags|length)==0 or ($route.inbound_tags|index($tag))!=null))
+         else ((.user_refs // [])|length)==0 end)) then .
+      else error("Invalid SOCKS5 user conditions") end' "$1"
+}
+
+# Discover the exact runtime authentication name, never the subscription's shortened account key.
+socks5OutboundUsers() (
+    local core=$1 selected=${2:-[]} dir=${3:-} file records='[]' rows
+    socks5OutboundPaths
+    if [[ -z "$dir" ]]; then
+        case "$core" in sing-box) dir=$s5SB ;; xray) dir=$s5XR ;; *) return 1 ;; esac
+    fi
+    for file in "$dir/"*.json; do
+        [[ -f "$file" && "$file" != "$dir/config.json" ]] || continue
+        rows=$(jq -ce --arg core "$core" --argjson selected "$selected" '
+          [.inbounds[]? | . as $in |
+            select((.tag|type)=="string" and (.tag|length)>0) |
+            select(($selected|length)==0 or (.tag as $tag | $selected|index($tag))!=null) |
+            (.type // .protocol) as $protocol |
+            (if $core=="sing-box" then
+               if ($protocol|IN("vless","vmess","trojan","hysteria2","tuic","anytls")) then
+                 .users[]? | {user:.name,account:.}
+               elif ($protocol|IN("naive","socks","http","mixed")) then
+                 .users[]? | {user:.username,account:.}
+               else empty end
+             else
+               if ($protocol|IN("vless","vmess","trojan")) then
+                 .settings.clients[]? | {user:.email,account:.}
+               elif $protocol=="hysteria" then
+                 .settings.users[]? | {user:.email,account:.}
+               elif ($protocol|IN("socks","http")) then
+                 .settings.accounts[]? | {user:.user,account:.}
+               else empty end
+             end) |
+            select((.user|type)=="string" and (.user|length)>0 and (.user|test("[[:cntrl:]]")|not)) |
+            . as $u |
+            {inbound_tag:$in.tag,protocol:$protocol,user:.user,
+             sensitive:([.account.password,.account.pass,.account.uuid,.account.id,.account.auth] |
+               any(.!=null and .==$u.user))} |
+            .sensitive=(.sensitive or (.user|test("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")))]' "$file") || return 1
+        records=$(jq -cn --argjson old "$records" --argjson rows "$rows" '$old+$rows') || return 1
+    done
+    # Ambiguous names cannot distinguish two accounts in the same inbound.
+    rows=$(jq -r 'group_by([.inbound_tag,.user])[]|select(length>1)|.[0].inbound_tag' <<<"$records") || return 1
+    if [[ -n "$rows" ]]; then
+        echoContent yellow "$(socks5OutboundText '发现同一入站内重名账号，已从用户选项中排除，请先修正配置' 'Duplicate authentication names in one inbound were excluded; fix the accounts first')" >&2
+    fi
+    jq 'group_by([.inbound_tag,.user]) | map(select(length==1)|.[0]) |
+      sort_by([.inbound_tag,.user]) | to_entries |
+      map(.value + {label:(if .value.sensitive then "[account #"+(.key+1|tostring)+"]" else .value.user end)} | del(.sensitive))' <<<"$records"
+)
+
+socks5OutboundChooseUsers() {
+    local core=$1 tags=$2 defaults=${3:-[]} users choice selected valid defaultLabel row unavailable
+    users=$(socks5OutboundUsers "$core" "$tags") || return 1
+    selected=$(jq -r --argjson refs "$defaults" '
+      [to_entries[]|select({inbound_tag:.value.inbound_tag,user:.value.user} as $u | $refs|index($u))|
+        (.key+1|tostring)]|join(",")' <<<"$users") || return 1
+    valid=$(jq -nr --argjson refs "$defaults" --argjson users "$users" '
+      all($refs[]; . as $r | any($users[]; .inbound_tag==$r.inbound_tag and .user==$r.user))') || return 1
+    echo >&2
+    echoContent skyBlue "$(socks5OutboundText '选择分流用户:' 'Select routing users:')" >&2
+    while IFS= read -r row; do echoContent yellow "$row" >&2; done < <(
+        jq -r 'to_entries[]|"\(.key+1). \(.value.label) | \(.value.protocol|ascii_upcase)(\(.value.inbound_tag))"' <<<"$users"
+    )
+    unavailable=$(socks5InboundTagList "$core" | jq -Rsr --argjson users "$users" --argjson tags "$tags" '
+      [split("\n")[]|select(length>0)|split("\t")|{protocol:.[1],tag:.[2]}|
+        select(($tags|length)==0 or (.tag as $tag | $tags|index($tag))!=null)|
+        select(.tag as $tag | all($users[];.inbound_tag!=$tag))|
+        (.protocol|ascii_upcase)+"("+.tag+")"]|unique|join(", ")') || return 1
+    if [[ -n "$unavailable" ]]; then
+        echoContent yellow "$(socks5OutboundText "以下入站无可选认证用户（无认证、未命名或暂不支持）：$unavailable" "No selectable authentication users (unauthenticated, unnamed, or unsupported): $unavailable")" >&2
+    elif [[ "$users" == '[]' ]]; then
+        echoContent yellow "$(socks5OutboundText '当前入站未发现可用于分流的认证用户，仅可不限制用户' 'No supported authentication users in these inbounds; only unrestricted users are available')" >&2
+    fi
+    if [[ "$valid" != true ]]; then
+        echoContent yellow "$(socks5OutboundText '原用户不在当前入站范围或已失效，请重新选择；0=明确取消用户限制' 'Previous users are outside this scope or unavailable; reselect, 0=remove restriction')" >&2
+        defaultLabel=$(socks5OutboundText '需重新选择' 'reselection required')
+    elif [[ -n "$selected" ]]; then
+        defaultLabel=$selected
+    else defaultLabel=$(socks5OutboundText '不限制用户' 'all users'); fi
+    echoContent yellow "$(socks5OutboundText '0.不限制用户' '0.All users')" >&2
+    echo
+    while true; do
+        socks5OutboundRead choice "选择用户编号（逗号多选，默认：${defaultLabel}，回车使用默认）:" "User numbers (comma separated, default: ${defaultLabel}, Enter=default):" || return 1
+        if [[ -z "$choice" ]]; then
+            [[ "$valid" == true ]] || continue
+            choice=${selected:-0}
+        fi
+        if [[ "$choice" == 0 ]]; then
+            printf '%s\n' '{"user_mode":"all","user_refs":[]}'
+            return 0
+        fi
+        if row=$(jq -cn --arg choice "$choice" --argjson users "$users" '
+          ($choice|split(",")|map(gsub("^\\s+|\\s+$";""))) as $parts |
+          if all($parts[];test("^[0-9]+$")) then ($parts|map(tonumber)) else error("invalid") end |
+          if length==0 or any(.[]; .<1 or .>($users|length)) then error("invalid")
+          else {user_mode:"selected",user_refs:([.[] as $n|$users[$n-1]|{inbound_tag,user}]|unique)} end' 2>/dev/null); then
+            printf '%s\n' "$row"
+            return 0
+        fi
+        echo
+        echoContent yellow "$(socks5OutboundText '编号无效，请输入列表中的数字，以逗号分隔' 'Invalid selection; enter listed numbers separated by commas')" >&2
+    done
+}
+
+# Validate references again during all recompiles, including other menus and candidate inbound edits.
+socks5OutboundCheckUsers() {
+    local routes=$1 core=$2 dir=${3:-} users stale needed
+    needed=$(jq -r --arg core "$core" 'any(.routes[]; .core==$core and (.user_mode // "all")=="selected")' <<<"$routes") || return 1
+    [[ "$needed" == true ]] || return 0
+    users=$(socks5OutboundUsers "$core" '[]' "$dir") || return 1
+    stale=$(jq -nr --argjson routes "$routes" --argjson users "$users" --arg core "$core" '
+      $routes.routes[]|select(.core==$core and .user_mode=="selected")|. as $r|
+      .user_refs[]|. as $u|select(any($users[];.inbound_tag==$u.inbound_tag and .user==$u.user)|not)|
+      $r.id+" ("+$u.inbound_tag+")"') || return 1
+    [[ -z "$stale" ]] && return 0
+    echoContent yellow "$(socks5OutboundText "用户引用已失效，请先修改或删除相关分流规则：$stale" "User references unavailable; edit or remove routes: $stale")" >&2
+    return 1
+}
+
+# Block scripted account deletion before the first live file is changed.
+socks5OutboundCheckUserRemoval() (
+    local core=$1 file=$2 selector=$3 value=$4 routes removed refs
+    socks5OutboundPaths
+    [[ -f "$s5State/routes.json" ]] || return 0
+    routes=$(socks5OutboundReadRoutes "$s5State/routes.json") || return 1
+    removed=$(jq -c --arg core "$core" --arg selector "$selector" --arg value "$value" '
+      [.inbounds[]? | . as $in |
+        (if $core=="xray" then (.settings.clients // .settings.users // []) else (.users // []) end) |
+        to_entries[] | select(if $selector=="index" then (.key|tostring)==$value
+          else (.value.id==$value or .value.uuid==$value or .value.password==$value or .value.auth==$value) end) |
+        {inbound_tag:$in.tag,user:(.value.email // .value.name // .value.username)}]' "$file") || return 1
+    refs=$(jq -nr --argjson routes "$routes" --argjson removed "$removed" --arg core "$core" '
+      [$routes.routes[]|select(.core==$core and (.user_mode // "all")=="selected")|. as $r|
+        .user_refs[]|select(. as $u|any($removed[];.inbound_tag==$u.inbound_tag and .user==$u.user))|$r.id]|unique|join(", ")') || return 1
+    [[ -z "$refs" ]] && return 0
+    echoContent yellow "$(socks5OutboundText "用户仍被分流规则引用，请先修改或删除规则：$refs" "User is referenced; edit or delete routes first: $refs")" >&2
+    return 1
+)
+
+# Expand targets as OR while retaining each inbound/authentication pair.
 socks5OutboundBuild() {
-    local core=$1 state=$2 modern=$3
-    jq -n --slurpfile ns "$state/outbounds.json" --slurpfile rs "$state/routes.json" \
-      --arg core "$core" --argjson modern "$modern" '
+    local core=$1 state=$2 modern=$3 routes
+    routes=$(socks5OutboundReadRoutes "$state/routes.json") || return 1
+    socks5OutboundCheckUsers "$routes" "$core" || return 1
+    jq -n --slurpfile ns "$state/outbounds.json" --argjson rs "$routes" \
+        --arg core "$core" --argjson modern "$modern" '
       def tag($id): first($ns[0].nodes[]|select(.id==$id)) |
           (.core_tags[$core] // ("socks5_"+.id));
       def active: select(.enabled != false);
       def routebase($r):
+        (if ($r.user_mode // "all")=="selected" then
+           $r.user_refs | group_by(.inbound_tag)[] |
+           {tags:[.[0].inbound_tag],users:map(.user)}
+         else {tags:$r.inbound_tags,users:[]} end) as $match |
         if $core=="sing-box" then
           {outbound:tag($r.outbound_node)}
           + (if $modern then {action:"route"} else {} end)
-          + (if $r.scope=="target_only" then {} else {inbound:$r.inbound_tags} end)
+          + (if ($match.tags|length)>0 then {inbound:$match.tags} else {} end)
+          + (if ($match.users|length)>0 then {auth_user:$match.users} else {} end)
         else
           {type:"field",outboundTag:tag($r.outbound_node)}
-          + (if $r.scope=="target_only" then {} else {inboundTag:$r.inbound_tags} end)
+          + (if ($match.tags|length)>0 then {inboundTag:$match.tags} else {} end)
+          + (if ($match.users|length)>0 then {user:$match.users} else {} end)
         end;
       def settag($s): "socks5_geosite_"+$s;
       def expand($r):
@@ -9275,8 +9646,10 @@ socks5OutboundBuild() {
           + (if ($r.rule_sets // []|length)>0 then [$base+{domain:[$r.rule_sets[]|"geosite:"+.]}] else [] end)
           + (if ($r.ip_cidrs // []|length)>0 then [$base+{ip:$r.ip_cidrs}] else [] end)
         end;
-      [ $rs[0].routes[] | active | select(.core==$core) ] |
-      sort_by([.priority, (if .scope=="match" then 0 elif .scope=="all" then 1 else 2 end), .id]) as $routes |
+      [ $rs.routes[] | active | select(.core==$core) ] |
+      sort_by([.priority, (if .scope=="all" then 1 else 0 end),
+        (if (.user_mode // "all")=="selected" then 0 else 1 end),
+        (if (.inbound_tags|length)>0 then 0 else 1 end), .id]) as $routes |
       {
         outbounds: [$ns[0].nodes[] | active | . as $node |
           if $core=="sing-box" then
@@ -9292,7 +9665,7 @@ socks5OutboundBuild() {
           {tag:settag(.),type:"remote",format:"binary",
            url:("https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-"+.+".srs")} ]
           + [ $routes[] | (.legacy_rule_sets // [])[] ] | unique_by(.tag)),
-        default_tag: (if $rs[0].defaults[$core] == null then null else tag($rs[0].defaults[$core]) end)
+        default_tag: (if $rs.defaults[$core] == null then null else tag($rs.defaults[$core]) end)
       }'
 }
 
@@ -9324,7 +9697,7 @@ socks5OutboundNormalizeSingBox() {
       def canonical: walk(if type=="array" and length==1 then .[0] else . end);
       (($m[0].rules+$guard[0])|map(canonical)) as $generated |
       [.route.rules[]? | select((canonical as $r | $generated|index($r))==null)]' \
-      "$config" >"$original" || return 1
+        "$config" >"$original" || return 1
     prefix=$(jq -n --slurpfile m "$compiled" --slurpfile guard "$work/sb-guard.json" '
       # Intersect each managed route with the existing allow condition. Keep the final deny.
       [ $guard[0][] |
@@ -9342,16 +9715,17 @@ socks5OutboundNormalizeSingBox() {
       .route.rules=$rules[0] |
       if $m[0].default_tag!=null then .route.final=$m[0].default_tag else . end |
       if .route.rule_set!=null then .route.rule_set|=unique_by(.tag) else . end' \
-      "$config" >"$config.tmp" && mv -f "$config.tmp" "$config"
+        "$config" >"$config.tmp" && mv -f "$config.tmp" "$config"
 }
 
 # Validate manifest references, scope, tag existence and complete shadowing before publishing.
 socks5OutboundValidate() {
-    local state=$1 core tags
-    jq -en --slurpfile n "$state/outbounds.json" --slurpfile r "$state/routes.json" '
+    local state=$1 onlyCore=${2:-} core tags routes
+    routes=$(socks5OutboundReadRoutes "$state/routes.json") || return 1
+    jq -en --slurpfile n "$state/outbounds.json" --argjson r "$routes" '
       def strings: type=="array" and all(.[];type=="string" and length>0);
-      $n[0] as $ns | $r[0] as $rs |
-      ($ns.version==1 and $rs.version==1) and
+      $n[0] as $ns | $r as $rs |
+      ($ns.version==1 and ($rs.version|IN(1,2))) and
       ($ns.nodes|type=="array") and ($rs.routes|type=="array") and
       ($ns.nodes|map(.id)|length== (unique|length)) and
       ($rs.routes|map(.id)|length== (unique|length)) and
@@ -9363,37 +9737,58 @@ socks5OutboundValidate() {
         ((.username=="")==(.password=="")) and (.enabled|type=="boolean")) and
       # Identical source/target matches cannot silently point to different nodes.
       ([$rs.routes[]|select(.enabled and .legacy_rule==null)|
-         [.core,.scope,(.inbound_tags|sort),(.domains|sort),(.rule_sets|sort),(.ip_cidrs|sort)]] |
+         [.core,.priority,.scope,(.inbound_tags|sort),(.user_mode // "all"),
+          ((.user_refs // [])|sort_by([.inbound_tag,.user])),(.domains|sort),(.rule_sets|sort),(.ip_cidrs|sort)]] |
          length==(unique|length)) and
       all($rs.routes[];
         . as $route |
         (.id|type=="string" and test("^[a-z0-9][a-z0-9-]*$")) and (.enabled|type=="boolean") and
         (.core|IN("sing-box","xray")) and (.scope|IN("all","match","target_only")) and
         (.priority|type=="number" and floor==. and .>=0 and .<=1000000) and
+        ((.user_mode // "all")|IN("all","selected")) and
+        ((.user_refs // [])|type=="array") and
+        (if (.user_mode // "all")=="selected" then
+           $rs.version==2 and .legacy_rule==null and (.user_refs|length)>0 and
+           all(.user_refs[]; (.inbound_tag|type=="string" and length>0) and (.user|type=="string" and length>0)) and
+           ((.user_refs|length)==(.user_refs|unique|length)) and
+           all(.user_refs[]; .inbound_tag as $tag | ($route.inbound_tags|length)==0 or ($route.inbound_tags|index($tag))!=null)
+         else ((.user_refs // [])|length)==0 end) and
         (.inbound_tags|strings) and (.domains|strings) and (.rule_sets|strings) and (.ip_cidrs|strings) and
         (.outbound_node as $id | any($ns.nodes[]; .id==$id and (.enabled or ($route.enabled|not)))) and
         (if .legacy_rule!=null then true
-         elif .scope=="all" then (.inbound_tags|length)>0 and
+         elif .scope=="all" then ((.inbound_tags|length)>0 or .user_mode=="selected") and
            ((.domains+.rule_sets+.ip_cidrs)|length)==0
-         elif .scope=="match" then (.inbound_tags|length)>0 and ((.domains+.rule_sets+.ip_cidrs)|length)>0
+         elif .scope=="match" then ((.inbound_tags|length)>0 or .user_mode=="selected") and ((.domains+.rule_sets+.ip_cidrs)|length)>0
          else (.inbound_tags|length)==0 and ((.domains+.rule_sets+.ip_cidrs)|length)>0 end)) and
       all(($rs.defaults // {})|to_entries[];
         .value==null or (.value as $id|any($ns.nodes[];.id==$id and .enabled))) and
-      # Any overlapping all/match pair must put the match first; duplicate all routes are rejected.
-      all($rs.routes[]|select(.enabled and .scope=="all"); . as $a |
-        all($rs.routes[]|select(.enabled and .core==$a.core and .id!=$a.id); . as $b |
-          if any($a.inbound_tags[]; . as $t | ($b.inbound_tags|index($t))!=null)
-          then ($b.scope!="all" and ($b.scope!="match" or $b.priority<=$a.priority))
-          else true end))
+      # Reject provably shadowed rules, considering the inbound/user pairs as one source condition.
+      (def rank: [.priority,(if .scope=="all" then 1 else 0 end),
+         (if (.user_mode // "all")=="selected" then 0 else 1 end),
+         (if (.inbound_tags|length)>0 then 0 else 1 end),.id];
+       def covers($a;$b):
+         if ($b.user_mode // "all")=="selected" then
+           all($b.user_refs[]; . as $u |
+             if ($a.user_mode // "all")=="selected" then any($a.user_refs[];.==$u)
+             else ($a.inbound_tags|length)==0 or ($a.inbound_tags|index($u.inbound_tag))!=null end)
+         elif ($a.user_mode // "all")=="selected" then false
+         elif ($a.inbound_tags|length)==0 then true
+         elif ($b.inbound_tags|length)==0 then false
+         else all($b.inbound_tags[]; . as $tag | ($a.inbound_tags|index($tag))!=null) end;
+       all($rs.routes[]|select(.enabled and .scope=="all" and .legacy_rule==null); . as $a |
+         all($rs.routes[]|select(.enabled and .core==$a.core and .id!=$a.id and .legacy_rule==null); . as $b |
+           (covers($a;$b) and (($a|rank)<($b|rank)))|not)))
       ' >/dev/null 2>&1 || {
         socks5OutboundText '节点、规则引用或优先级冲突，未保存' 'Invalid node, reference, or conflicting rule priority; nothing saved' >&2
         return 1
     }
     for core in sing-box xray; do
+        [[ -z "$onlyCore" || "$core" == "$onlyCore" ]] || continue
+        socks5OutboundCheckUsers "$routes" "$core" || return 1
         tags=$(socks5InboundTagList "$core" | cut -f3 | jq -Rsc 'split("\n")|map(select(length>0))') || return 1
         jq -e --arg core "$core" --argjson tags "$tags" '
           all(.routes[]|select(.core==$core and .enabled and .legacy_rule==null);
-            all(.inbound_tags[]; . as $tag | ($tags|index($tag))!=null))' "$state/routes.json" >/dev/null || {
+            all(.inbound_tags[]; . as $tag | ($tags|index($tag))!=null))' <<<"$routes" >/dev/null || {
             socks5OutboundText "入站 tag 已变化，请先修改或禁用 $core 的旧规则" "Inbound tags changed; edit or disable stale $core rules first" >&2
             return 1
         }
@@ -9406,7 +9801,7 @@ socks5OutboundLoad() {
     mkdir -p "$state" || return 1
     if [[ -f "$s5State/outbounds.json" || -f "$s5State/routes.json" ]]; then
         cp -p "$s5State/outbounds.json" "$state/outbounds.json" &&
-            cp -p "$s5State/routes.json" "$state/routes.json"
+            socks5OutboundReadRoutes "$s5State/routes.json" >"$state/routes.json"
         return $?
     fi
     printf '%s\n' '{"version":1,"nodes":[]}' >"$state/outbounds.json"
@@ -9422,13 +9817,14 @@ socks5OutboundLoad() {
               {id:$id,name:("Imported "+$core),server:.server,server_port:.server_port,
                username:(.username // ""),password:(.password // ""),version:"5",enabled:true,
                core_tags:{($core):.tag},legacy:true}' "$old") || return 1
-            routes='[]'; tags='[]'
+            routes='[]'
+            tags='[]'
             for file in "$dir"/*.json; do
                 [[ -f "$file" ]] || continue
                 routes=$(jq -c --argjson previous "$routes" \
-                  '$previous+[.route.rules[]?|select(.outbound=="socks5_outbound")]' "$file") || return 1
+                    '$previous+[.route.rules[]?|select(.outbound=="socks5_outbound")]' "$file") || return 1
                 tags=$(jq -c --argjson previous "$tags" \
-                  '$previous+(.route.rule_set // [])|unique_by(.tag)' "$file") || return 1
+                    '$previous+(.route.rule_set // [])|unique_by(.tag)' "$file") || return 1
             done
             "$s5SBin" merge "$state/legacy-merged.tmp" -C "$dir" -D "$s5Root/sing-box/conf" >/dev/null 2>&1 || return 1
             defaultTag=$(jq -r '.route.final // .outbounds[0].tag // ""' "$state/legacy-merged.tmp") || return 1
@@ -9441,11 +9837,12 @@ socks5OutboundLoad() {
                username:(.settings.servers[0].users[0].user // ""),
                password:(.settings.servers[0].users[0].pass // ""),
                enabled:true,core_tags:{($core):.tag},legacy:true}' "$old") || return 1
-            routes='[]'; tags='[]'
+            routes='[]'
+            tags='[]'
             for file in "$dir"/*.json; do
                 [[ -f "$file" ]] || continue
                 routes=$(jq -c --argjson previous "$routes" \
-                  '$previous+[.routing.rules[]?|select(.outboundTag=="socks5_outbound")]' "$file") || return 1
+                    '$previous+[.routing.rules[]?|select(.outboundTag=="socks5_outbound")]' "$file") || return 1
             done
             "$s5XBin" run -dump -confdir "$dir" >"$state/legacy-merged.tmp" 2>/dev/null || return 1
             defaultTag=$(jq -r '.outbounds[0].tag // ""' "$state/legacy-merged.tmp") || return 1
@@ -9453,9 +9850,9 @@ socks5OutboundLoad() {
         fi
         socks5OutboundJsonWrite "$state/outbounds.json" --argjson node "$node" '.nodes+=[$node]' || return 1
         while IFS= read -r rule; do
-            index=$((index+1))
+            index=$((index + 1))
             socks5OutboundJsonWrite "$state/routes.json" --arg id "legacy-$core-$index" \
-              --arg core "$core" --arg node "$id" --argjson rule "$rule" --argjson sets "$tags" '
+                --arg core "$core" --arg node "$id" --argjson rule "$rule" --argjson sets "$tags" '
               .routes += [{id:$id,core:$core,scope:"target_only",inbound_tags:[],
                 domains:[],rule_sets:[],ip_cidrs:[],outbound_node:$node,priority:100,
                 enabled:true,legacy_rule:$rule,legacy_rule_sets:$sets}]' || return 1
@@ -9463,7 +9860,7 @@ socks5OutboundLoad() {
         # Import the actual implicit/explicit default, rather than inferring it from absent rules.
         if [[ "$defaultTag" == socks5_outbound ]]; then
             socks5OutboundJsonWrite "$state/routes.json" --arg core "$core" --arg node "$id" \
-              '.defaults[$core]=$node' || return 1
+                '.defaults[$core]=$node' || return 1
         fi
     done
 }
@@ -9473,8 +9870,10 @@ socks5OutboundModern() {
     version=$("$s5SBin" version 2>/dev/null | sed -nE 's/^sing-box version ([0-9]+)\.([0-9]+).*/\1 \2/p')
     [[ "$version" =~ ^[0-9]+\ [0-9]+$ ]] || return 1
     read -r major minor <<<"$version"
-    if ((major>1 || minor>=11)); then printf '%s' true
-    elif ((major==1 && minor>=8)); then printf '%s' false
+    if ((major > 1 || minor >= 11)); then
+        printf '%s' true
+    elif ((major == 1 && minor >= 8)); then
+        printf '%s' false
     else return 1; fi
 }
 
@@ -9488,7 +9887,7 @@ socks5OutboundStage() {
         compiled="$work/$core-compiled.json"
         socks5OutboundBuild "$core" "$state" "$modern" >"$compiled" || return 1
         jq -s '[.[]|.outbounds[]?|select(.type=="block" or .protocol=="blackhole")|.tag]' \
-          "$dir/"*.json >"$work/guard-tags.json" || return 1
+            "$dir/"*.json >"$work/guard-tags.json" || return 1
         socks5OutboundJsonWrite "$compiled" --slurpfile tags "$work/guard-tags.json" '.guard_tags=$tags[0]' || return 1
         # Only remove legacy files once they have been imported.
         if jq -es --arg core "$core" 'any(.[].nodes[]; .legacy==true and .core_tags[$core]=="socks5_outbound")' "$state/outbounds.json" "$work/before/outbounds.json" >/dev/null; then
@@ -9517,7 +9916,7 @@ socks5OutboundStage() {
               all(.outbounds[]?; .tag as $tag | ($tags[0]|index($tag))==null)' "$file" >/dev/null || return 1
             jq -e --slurpfile m "$compiled" '
               all(.route.rule_set[]?; . as $old | all($m[0].rule_sets[]; .tag!=$old.tag or .==$old))' \
-              "$file" >/dev/null || return 1
+                "$file" >/dev/null || return 1
         done
         # "tail" is required for Xray to preserve the pre-existing implicit default outbound.
         jq '{outbounds:.outbounds}' "$compiled" >"$dir/zz_socks5_outbounds_tail.json" || return 1
@@ -9546,7 +9945,7 @@ socks5OutboundStage() {
             jq --slurpfile rules "$work/xr-ordered.json" --slurpfile m "$compiled" '
               {routing:(.routing+{rules:($rules[0]+
                 (if $m[0].default_tag!=null then [{type:"field",network:"tcp,udp",outboundTag:$m[0].default_tag}] else [] end))})}' \
-              "$work/xray-original.json" >"$dir/zz_socks5_routes.json" || return 1
+                "$work/xray-original.json" >"$dir/zz_socks5_routes.json" || return 1
             # A later routing section would replace the generated section. Refuse ambiguous custom layouts.
             for file in "$dir"/*.json; do
                 [[ "$file" > "$dir/zz_socks5_routes.json" ]] || continue
@@ -9554,21 +9953,6 @@ socks5OutboundStage() {
             done
             "$s5XBin" run -test -confdir "$dir" >"$work/check.log" 2>&1 || return 1
         fi
-    done
-}
-
-socks5OutboundReload() {
-    local core=$1 attempt
-    # Candidate files were already checked. Do not run generators again during publish or rollback.
-    if [[ "${release:-}" == alpine ]]; then
-        rc-service "$core" restart || return 1
-    else
-        systemctl restart "$core.service" || return 1
-    fi
-    for ((attempt=0; attempt<5; attempt++)); do
-        sleep 0.2
-        if [[ "${release:-}" == alpine ]]; then rc-service "$core" status >/dev/null || return 1
-        else systemctl is-active --quiet "$core.service" || return 1; fi
     done
 }
 
@@ -9587,21 +9971,25 @@ socks5OutboundTransaction() (
     socks5OutboundPaths
     mkdir -p "$s5State" || return 1
     mkdir "$s5State/.lock" 2>/dev/null || {
-        socks5OutboundText '另一个出站操作正在执行' 'Another outbound operation is running' >&2; return 1;
+        socks5OutboundText '另一个出站操作正在执行' 'Another outbound operation is running' >&2
+        return 1
     }
     local work success=false published=false rollbackFailed=false path rel group src dst old core liveState=false
     local -a changed=() cores=()
-    work=$(mktemp -d "$s5State/.transaction.XXXXXX") || { rmdir "$s5State/.lock"; return 1; }
+    work=$(mktemp -d "$s5State/.transaction.XXXXXX") || {
+        rmdir "$s5State/.lock"
+        return 1
+    }
     socks5OutboundFinish() {
         local i
         trap - EXIT HUP INT TERM
         if [[ "$success" != true && "$published" == true ]]; then
-            for ((i=${#changed[@]}-1; i>=0; i--)); do
+            for ((i = ${#changed[@]} - 1; i >= 0; i--)); do
                 if [[ -f "$work/backup/$i" ]]; then
                     cp -p "$work/backup/$i" "${changed[i]}" || rollbackFailed=true
                 else rm -f "${changed[i]}" || rollbackFailed=true; fi
             done
-            for core in "${cores[@]}"; do socks5OutboundReload "$core" || rollbackFailed=true; done
+            reloadCore transaction "${cores[@]}" || rollbackFailed=true
             socks5OutboundText '操作失败，已恢复修改前配置' 'Operation failed; previous configuration restored' >&2
         fi
         if [[ "$rollbackFailed" == true ]]; then
@@ -9611,8 +9999,9 @@ socks5OutboundTransaction() (
     }
     trap socks5OutboundFinish EXIT
     trap 'exit 1' HUP INT TERM
-    mkdir -p "$work/state" "$work/before" "$work/backup" || return 1
+    mkdir -p "$work/state" "$work/before" "$work/backup" "$work/live-state" || return 1
     [[ ! -f "$s5State/outbounds.json" ]] || liveState=true
+    [[ "$liveState" == false ]] || cp -p "$s5State/"*.json "$work/live-state/" || return 1
     socks5OutboundLoad "$work/state" || return 1
     cp -p "$work/state/"*.json "$work/before/" || return 1
     if [[ -x "$s5SBin" && -d "$s5SB" ]]; then
@@ -9639,7 +10028,10 @@ socks5OutboundTransaction() (
     # Abort if another task changed the inputs during staging.
     [[ ! -d "$work/sb-before" ]] || socks5OutboundSourcesEqual "$s5SB" "$work/sb-before" || return 1
     [[ ! -d "$work/xr-before" ]] || socks5OutboundSourcesEqual "$s5XR" "$work/xr-before" || return 1
-    [[ "$liveState" == false ]] || socks5OutboundSourcesEqual "$s5State" "$work/before" || return 1
+    [[ "$liveState" == false ]] || socks5OutboundSourcesEqual "$s5State" "$work/live-state" || return 1
+    if jq -e '.version==2' "$work/state/routes.json" >/dev/null; then
+        socks5OutboundJsonWrite "$work/state/routes.json" '.rules=.routes | del(.routes)' || return 1
+    fi
     published=true
     for group in state sb xr; do
         [[ -d "$work/$group" ]] || continue
@@ -9666,9 +10058,11 @@ socks5OutboundTransaction() (
         path="$s5Root/sing-box/conf/config.json"
         [[ ! -f "$path" ]] || cp -p "$path" "$work/backup/${#changed[@]}" || return 1
         changed+=("$path")
-        cp "$work/sing-box.json" "$path.socks5-tmp" && chmod 600 "$path.socks5-tmp" && mv -f "$path.socks5-tmp" "$path" || return 1
+        # Publish the merged configuration that staging already validated.
+        cp "$work/sing-box.json" "$path.socks5-tmp" &&
+            chmod 600 "$path.socks5-tmp" && mv -f "$path.socks5-tmp" "$path" || return 1
     fi
-    for core in "${cores[@]}"; do socks5OutboundReload "$core" || return 1; done
+    reloadCore transaction "${cores[@]}" || return 1
     local backup
     backup="$s5State/backup/$(date +%Y%m%d-%H%M%S)-$RANDOM"
     mkdir -p "$backup" || return 1
@@ -9677,13 +10071,64 @@ socks5OutboundTransaction() (
     done
     printf '%s\n' "${changed[@]}" >"$backup/paths"
     success=true
+    # Report completion only after publishing and restarting the affected cores.
+    local completedCN completedEN
+    case "$callback" in
+    socks5OutboundEditNode)
+        if [[ "${2:-false}" == true ]]; then
+            completedCN='节点修改完成'
+            completedEN='Node update completed'
+        else
+            completedCN='落地机添加完成'
+            completedEN='Node added'
+        fi
+        ;;
+    socks5OutboundSaveRoute)
+        if [[ "${2:-false}" == true ]]; then
+            completedCN='分流规则修改完成'
+            completedEN='Route update completed'
+        else
+            completedCN='分流规则添加完成'
+            completedEN='Route added'
+        fi
+        ;;
+    socks5OutboundDelete)
+        if [[ "$1" == node ]]; then
+            completedCN='节点删除完成'
+            completedEN='Node deleted'
+        else
+            completedCN='分流规则删除完成'
+            completedEN='Route deleted'
+        fi
+        ;;
+    socks5OutboundSetDefault)
+        if [[ -n "$2" ]]; then
+            completedCN='全局默认出站设置完成'
+            completedEN='Global default outbound set'
+        else
+            completedCN='原默认出站恢复完成'
+            completedEN='Previous default outbound restored'
+        fi
+        ;;
+    socks5OutboundEmpty)
+        completedCN='SOCKS5 出站和规则卸载完成'
+        completedEN='SOCKS5 outbounds and routes removed'
+        ;;
+    socks5OutboundToggle)
+        completedCN='节点或规则状态修改完成'
+        completedEN='Node or route status updated'
+        ;;
+    *) return 0 ;;
+    esac
+    echoContent green " ---> $(socks5OutboundText "$completedCN" "$completedEN")"
+    echo
 )
 
 socks5OutboundSaveNode() {
     local state=$1 node=$2 id
     id=$(jq -r '.id' <<<"$node") || return 1
     socks5OutboundJsonWrite "$state/outbounds.json" --arg id "$id" --argjson node "$node" \
-      '.nodes=([.nodes[]|select(.id!=$id)]+[$node])'
+        '.nodes=([.nodes[]|select(.id!=$id)]+[$node])'
 }
 
 socks5OutboundSaveRoute() {
@@ -9694,13 +10139,14 @@ socks5OutboundSaveRoute() {
         route=$(jq --argjson old "$old" '.enabled=$old.enabled' <<<"$route") || return 1
     fi
     socks5OutboundJsonWrite "$state/routes.json" --arg id "$id" --argjson route "$route" \
-      '.routes=([.routes[]|select(.id!=$id)]+[$route])'
+        '.routes=([.routes[]|select(.id!=$id)]+[$route]) |
+       if $route.user_mode=="selected" then .version=2 else . end'
 }
 
 socks5OutboundSetDefault() {
     local state=$1 core=$2 node=$3
     socks5OutboundJsonWrite "$state/routes.json" --arg core "$core" --arg node "$node" \
-      '.defaults[$core]=(if $node=="" then null else $node end)'
+        '.defaults[$core]=(if $node=="" then null else $node end)'
 }
 
 socks5OutboundDelete() {
@@ -9709,7 +10155,8 @@ socks5OutboundDelete() {
         jq -e --arg id "$id" 'any(.nodes[];.id==$id)' "$state/outbounds.json" >/dev/null || return 1
         # Never implicitly cascade: a referenced node must be rebound first.
         jq -e --arg id "$id" 'all(.routes[];.outbound_node!=$id) and all(.defaults[];.!=$id)' "$state/routes.json" >/dev/null || {
-            socks5OutboundText '节点仍被规则或默认出站引用，请先改绑' 'Node is still referenced by routes or a default; rebind them first' >&2; return 1;
+            socks5OutboundText '节点仍被规则或默认出站引用，请先改绑' 'Node is still referenced by routes or a default; rebind them first' >&2
+            return 1
         }
         socks5OutboundJsonWrite "$state/outbounds.json" --arg id "$id" '.nodes|=map(select(.id!=$id))'
     else
@@ -9720,11 +10167,16 @@ socks5OutboundDelete() {
 
 socks5OutboundToggle() {
     local state=$1 kind=$2 id=$3 file field
-    if [[ "$kind" == node ]]; then file="$state/outbounds.json"; field=nodes
-    else file="$state/routes.json"; field=routes; fi
+    if [[ "$kind" == node ]]; then
+        file="$state/outbounds.json"
+        field=nodes
+    else
+        file="$state/routes.json"
+        field=routes
+    fi
     jq -e --arg id "$id" --arg field "$field" 'any(.[$field][];.id==$id)' "$file" >/dev/null || return 1
     socks5OutboundJsonWrite "$file" --arg id "$id" --arg field "$field" \
-      '.[$field]|=map(if .id==$id then .enabled=(.enabled|not) else . end)'
+        '.[$field]|=map(if .id==$id then .enabled=(.enabled|not) else . end)'
 }
 
 socks5OutboundEmpty() {
@@ -9733,39 +10185,371 @@ socks5OutboundEmpty() {
     printf '%s\n' '{"version":1,"routes":[],"defaults":{"sing-box":null,"xray":null}}' >"$state/routes.json"
 }
 
-socks5OutboundView() (
+# Empty manifests left by uninstall do not mean an outbound is installed.
+socks5OutboundInstalled() (
     umask 077
     socks5OutboundPaths
     local temp
+    temp=$(mktemp -d) || return 2
+    trap 'rm -rf "$temp"' EXIT
+    if ! socks5OutboundLoad "$temp" || ! jq -e '.nodes|type=="array"' "$temp/outbounds.json" >/dev/null 2>&1; then
+        echoContent yellow "$(socks5OutboundText 'SOCKS5 出站配置读取失败，请检查配置' 'Unable to read SOCKS5 outbound configuration; check the configuration')" >&2
+        echo >&2
+        return 2
+    fi
+    jq -e '.nodes|length>0' "$temp/outbounds.json" >/dev/null
+)
+
+socks5OutboundRequireInstalled() {
+    local status
+    socks5OutboundInstalled && return 0
+    status=$?
+    if [[ "$status" == 1 ]]; then
+        echoContent yellow "$(socks5OutboundText '未安装 SOCKS5 出站，请先添加落地机' 'SOCKS5 outbound is not installed; add a node first')"
+        echo
+    fi
+    return "$status"
+}
+
+# Keep internal IDs in the snapshot for number selection, never in the display text.
+socks5OutboundDisplayData() (
+    umask 077
+    socks5OutboundPaths
+    local temp core users='[]' discovered
     temp=$(mktemp -d) || return 1
     trap 'rm -rf "$temp"' EXIT
     socks5OutboundLoad "$temp" || return 1
-    # Credentials are never printed by view or previews.
-    jq '.nodes|map(del(.username,.password))' "$temp/outbounds.json"
-    jq '.' "$temp/routes.json"
+    for core in sing-box xray; do
+        socks5InboundTagList "$core" || return 1
+    done >"$temp/inbounds.tsv"
+    jq -Rn '[inputs|select(length>0)|split("\t")|{core:.[0],protocol:.[1],tag:.[2]}]' \
+        "$temp/inbounds.tsv" >"$temp/inbounds.json" || return 1
+    for core in sing-box xray; do
+        discovered=$(socks5OutboundUsers "$core") || return 1
+        users=$(jq -cn --arg core "$core" --argjson old "$users" --argjson rows "$discovered" '$old+[$rows[]|.+{core:$core}]') || return 1
+    done
+    jq -n --argjson users "$users" --arg lang "$(socks5OutboundLanguage)" \
+        --slurpfile ns "$temp/outbounds.json" --slurpfile rs "$temp/routes.json" \
+        --slurpfile ins "$temp/inbounds.json" '
+      def text($cn;$en): if $lang=="en" then $en else $cn end;
+      def inbound($core;$tags):
+        [$tags[] as $tag |
+          (first($ins[0][]|select(.core==$core and .tag==$tag)) // null) as $in |
+          if $in==null then $tag else ($in.protocol|ascii_upcase)+"("+$tag+")" end] |
+        if length==0 then text("所有入站";"All inbounds") else join(", ") end;
+      def user_label($core;$ref):
+        first($users[]|select(.core==$core and .inbound_tag==$ref.inbound_tag and .user==$ref.user)|.label)
+        // text("[账号已失效]";"[unavailable account]");
+      def source:
+        . as $r |
+        if (.user_mode // "all")=="selected" then
+          (.user_refs|group_by(.inbound_tag)|map(
+            inbound($r.core;[.[0].inbound_tag])+" | "+text("用户:";"Users:")+
+            (map(user_label($r.core;.))|join(", ")))|join("; "))
+        else inbound(.core;(.inbound_tags // []))+" | "+text("用户:全部";"Users:all") end;
+      def node_name($id): first($ns[0].nodes[]|select(.id==$id)|.name) // text("未知落地机";"Unknown node");
+      def state: if .enabled==false then text(" | 已禁用";" | Disabled") else "" end;
+      def targets:
+        ((.domains // []) + ((.rule_sets // [])|map("geosite:"+.)) + (.ip_cidrs // []))|join(", ");
+      {
+        nodes: [$ns[0].nodes[]|
+          {id:.id,enabled:(.enabled!=false),text:(text("名称:";"Name:")+.name+" | "+
+            (if (.server|contains(":")) then "["+.server+"]" else .server end)+":"+(.server_port|tostring)+
+            " | "+(if .user_mode=="selected" then (. + {core:.inbound_core}|source)
+                     else inbound(.inbound_core;(.inbound_tags // [])) end)+state)}],
+        routes: [$rs[0].routes[]|
+          {id:.id,text:((if .legacy_rule!=null then text("已有规则";"Existing rule")
+            elif .scope=="all" then text("全部转发";"Forward all traffic")
+            elif .scope=="match" or (.user_mode // "all")=="selected" then text("目标匹配";"Match targets")
+            else text("目标匹配（所有入站）";"Match targets (all inbounds)") end)+" | "+
+            (source)+
+            " → "+node_name(.outbound_node)+
+            (if .scope!="all" and (targets|length)>0 then " | "+targets else "" end)+
+            text(" | 优先级:";" | Priority:")+(.priority|tostring)+state)}],
+        defaults: [$rs[0].defaults // {}|to_entries[]|select(.value!=null)|
+          .key+" | "+text("全部转发";"Forward all traffic")+" → "+node_name(.value)]
+      }'
 )
 
-socks5OutboundInputNode() {
-    local name server port user pass='' id=$1 node
-    socks5OutboundRead name '落地机名称:' 'Node name:' || return 1
-    socks5OutboundRead server '地址（IPv4/IPv6/域名）:' 'Address (IPv4/IPv6/domain):' || return 1
-    socks5OutboundRead port '端口:' 'Port:' || return 1
-    socks5OutboundRead user '用户名（空=无认证）:' 'Username (blank=no authentication):' || return 1
-    if [[ -n "$user" ]]; then
-        local prompt
-        prompt=$(socks5OutboundText '密码:' 'Password:')
-        read -r -s -p "$prompt " pass || return 1
-        printf '\n'
+socks5OutboundView() {
+    local data row
+    data=$(socks5OutboundDisplayData) || return 1
+    if ! jq -e '.nodes|length>0' <<<"$data" >/dev/null; then
+        echoContent yellow "$(socks5OutboundText '未安装 SOCKS5 出站，请先添加落地机' 'SOCKS5 outbound is not installed; add a node first')"
+        echo
+        return 1
     fi
-    [[ "$port" =~ ^[0-9]{1,5}$ ]] && ((10#$port>=1 && 10#$port<=65535)) || return 1
+    echo
+    echoContent skyBlue "$(socks5OutboundText '落地机:' 'Nodes:')"
+    while IFS= read -r row; do echoContent green "$row"; done < <(jq -r '.nodes|to_entries[]|"\(.key+1). \(.value.text)"' <<<"$data")
+    echo
+    echoContent skyBlue "$(socks5OutboundText '分流规则:' 'Routing rules:')"
+    if jq -e '(.routes|length)+(.defaults|length)>0' <<<"$data" >/dev/null; then
+        while IFS= read -r row; do echoContent green "$row"; done < <(jq -r '(.routes|to_entries[]|"\(.key+1). \(.value.text)"),(.defaults[]|.)' <<<"$data")
+    else
+        echoContent green "$(socks5OutboundText '暂无分流规则' 'No routing rules')"
+    fi
+    echo
+}
+
+# Return a selected snapshot item as JSON. Display goes to stderr for command substitution.
+# Status 2 means back/cancel; default mode uses 0 to restore the original outbound.
+socks5OutboundChooseItem() {
+    local kind=$1 mode=${2:-manage} data items choice row selected
+    data=$(socks5OutboundDisplayData) || return 1
+    items=$(jq -c --arg kind "$kind" --arg mode "$mode" '
+      .[$kind]|if $mode=="enabled" or $mode=="default" then map(select(.enabled)) else . end' <<<"$data") || return 1
+    echo >&2
+    if [[ "$kind" == nodes ]]; then
+        echoContent skyBlue "$(socks5OutboundText '落地机:' 'Nodes:')" >&2
+    else
+        echoContent skyBlue "$(socks5OutboundText '分流规则:' 'Routing rules:')" >&2
+    fi
+    if ! jq -e 'length>0' <<<"$items" >/dev/null; then
+        if [[ "$kind" == nodes ]]; then
+            echoContent yellow "$(socks5OutboundText '暂无可用落地机，请先添加落地机' 'No available nodes; add a node first')" >&2
+            if [[ "$mode" != default ]]; then
+                echo >&2
+                return 2
+            fi
+        else
+            echoContent green "$(socks5OutboundText '暂无分流规则' 'No routing rules')" >&2
+        fi
+    else
+        while IFS= read -r row; do echoContent green "$row" >&2; done < <(jq -r 'to_entries[]|"\(.key+1). \(.value.text)"' <<<"$items")
+    fi
+    echo >&2
+    if [[ "$mode" == default ]]; then
+        echoContent yellow "$(socks5OutboundText '0.恢复原默认出站  回车返回' '0.Restore previous default  Enter to go back')" >&2
+    elif [[ "$kind" == routes ]] && ! jq -e 'length>0' <<<"$items" >/dev/null; then
+        echoContent yellow "$(socks5OutboundText '1.添加规则  0.返回' '1.Add route  0.Back')" >&2
+    else
+        echoContent yellow "$(socks5OutboundText '0.返回' '0.Back')" >&2
+    fi
+    while true; do
+        socks5OutboundRead choice '选择编号:' 'Select number:' || return 2
+        if [[ "$kind" == routes && "$choice" == 1 ]] && ! jq -e 'length>0' <<<"$items" >/dev/null; then
+            printf '{"action":"add"}\n'
+            return 0
+        fi
+        if [[ "$mode" == default && "$choice" == 0 ]]; then
+            printf '{"id":""}\n'
+            return 0
+        fi
+        [[ -n "$choice" && "$choice" != 0 ]] || return 2
+        if selected=$(jq -ce --arg choice "$choice" '
+          if ($choice|test("^[0-9]+$")) then ($choice|tonumber) as $n |
+            if $n>=1 and $n<=length then .[$n-1] else empty end else empty end' <<<"$items"); then
+            printf '%s\n' "$selected"
+            return 0
+        fi
+        echoContent yellow "$(socks5OutboundText '编号无效，请重新输入' 'Invalid number; try again')" >&2
+    done
+}
+
+socks5OutboundManage() {
+    local kind=$1 selected id choice status confirm
+    while true; do
+        if selected=$(socks5OutboundChooseItem "$kind"); then
+            :
+        else
+            status=$?
+            [[ "$status" == 2 ]] && return 0
+            return 1
+        fi
+        if [[ "$(jq -r '.action // ""' <<<"$selected")" == add ]]; then
+            socks5OutboundInputRoute '' || return 1
+            continue
+        fi
+        id=$(jq -r '.id' <<<"$selected") || return 1
+        echo
+        echoContent green "$(socks5OutboundText '已选:' 'Selected:') $(jq -r '.text' <<<"$selected")"
+        echo
+        if [[ "$kind" == nodes ]]; then
+            echoContent yellow "$(socks5OutboundText '1.编辑  2.删除  3.测试  0.返回' '1.Edit  2.Delete  3.Test  0.Back')"
+        else
+            echoContent yellow "$(socks5OutboundText '1.编辑  2.删除  0.返回' '1.Edit  2.Delete  0.Back')"
+        fi
+        socks5OutboundRead choice '请选择:' 'Select:' || return 0
+        case "$choice" in
+        1)
+            if [[ "$kind" == nodes ]]; then
+                socks5OutboundInputNode "$id" || return 1
+            else socks5OutboundInputRoute "$id" || return 1; fi
+            ;;
+        2)
+            socks5OutboundRead confirm '确认删除？[y/n]:' 'Confirm deletion? [y/n]:' || return 0
+            if [[ "$confirm" == y || "$confirm" == Y ]]; then
+                if [[ "$kind" == nodes ]]; then
+                    socks5OutboundTransaction socks5OutboundDelete node "$id" || return 1
+                else socks5OutboundTransaction socks5OutboundDelete route "$id" || return 1; fi
+                socks5OutboundInstalled && continue
+                status=$?
+                [[ "$status" == 1 ]] && return 0
+                return 1
+            fi
+            ;;
+        3)
+            [[ "$kind" == nodes ]] || continue
+            socks5OutboundTestNode "$id" || return 1
+            ;;
+        0 | '') continue ;;
+        *) echoContent yellow "$(socks5OutboundText '编号无效，请重新输入' 'Invalid number; try again')" ;;
+        esac
+    done
+}
+
+socks5OutboundMoreMenu() {
+    local choice selected status confirm node
+    while true; do
+        echo
+        echoContent skyBlue "$(socks5OutboundText '更多操作:' 'More actions:')"
+        echoContent yellow "$(socks5OutboundText '1.设置默认出站  2.卸载全部出站  0.返回' '1.Set default outbound  2.Uninstall all outbounds  0.Back')"
+        socks5OutboundRead choice '请选择:' 'Select:' || return 0
+        case "$choice" in
+        1)
+            socks5OutboundChooseCore || return 1
+            if selected=$(socks5OutboundChooseItem nodes default); then
+                :
+            else
+                status=$?
+                [[ "$status" == 2 ]] && continue
+                return 1
+            fi
+            node=$(jq -r '.id' <<<"$selected") || return 1
+            socks5OutboundTransaction socks5OutboundSetDefault "$socks5SelectedCore" "$node" || return 1
+            ;;
+        2)
+            socks5OutboundRead confirm '卸载全部出站和规则？[y/n]:' 'Remove all outbounds and routes? [y/n]:' || return 0
+            if [[ "$confirm" == y || "$confirm" == Y ]]; then
+                socks5OutboundTransaction socks5OutboundEmpty || return 1
+                return 0
+            fi
+            ;;
+        0 | '') return 0 ;;
+        *) echoContent yellow "$(socks5OutboundText '编号无效，请重新输入' 'Invalid number; try again')" ;;
+        esac
+    done
+}
+
+socks5OutboundChooseTags() {
+    local core=$1 default=${2:-[]} rows count selected choice tags row defaultLabel
+    rows=$(socks5InboundTagList "$core") || return 1
+    tags=$(jq -Rn '[inputs|select(length>0)|split("\t")|{protocol:.[1],tag:.[2]}]|unique_by(.tag)' <<<"$rows") || return 1
+    count=$(jq 'length' <<<"$tags") || return 1
+    if ((count == 0)); then
+        echoContent yellow "$(socks5OutboundText '未发现可用入站 Tag' 'No inbound tags found')" >&2
+        return 1
+    fi
+    # Callers capture stdout as JSON. Keep all display output on stderr.
+    echo >&2
+    echoContent skyBlue "$(socks5OutboundText '绑定入站节点:' 'Bind inbound nodes:')" >&2
+    while IFS= read -r row; do
+        echoContent yellow "$row" >&2
+    done < <(jq -r 'to_entries[]|"\(.key+1). \(.value.protocol|ascii_upcase)(\(.value.tag))"' <<<"$tags")
+    if [[ "$default" == all ]]; then
+        selected=$(jq -r '[range(1;length+1)|tostring]|join(",")' <<<"$tags") || return 1
+    else
+        selected=$(jq -r --argjson defaults "$default" '[to_entries[]|select(.value.tag as $tag|$defaults|index($tag))|(.key+1|tostring)]|join(",")' <<<"$tags") || return 1
+        selected=${selected:-0}
+    fi
+    echoContent yellow "$(socks5OutboundText '不绑定时，分流规则对当前核心的所有入站生效' 'Without a binding, routing rules apply to all inbounds of the selected core')" >&2
+    echo
+    if [[ "$selected" == 0 ]]; then
+        defaultLabel=$(socks5OutboundText '不绑定' 'unbound')
+    else
+        defaultLabel=$selected
+    fi
+    while true; do
+        socks5OutboundRead choice "选择入站编号（逗号多选，默认：${defaultLabel}，回车使用默认，0=不绑定）:" "Inbound numbers (comma separated, default: ${defaultLabel}, Enter=default, 0=unbound):" || return 1
+        choice=${choice:-$selected}
+        if [[ "$choice" == 0 ]]; then
+            printf '[]\n'
+            return 0
+        fi
+        if rows=$(jq -cn --arg choice "$choice" --argjson tags "$tags" '
+          ($choice|split(",")|map(gsub("^[[:space:]]+|[[:space:]]+$";""))) as $parts |
+          if all($parts[]; test("^[0-9]+$")) then ($parts|map(tonumber)) else error("invalid selection") end |
+          if any(.[]; .<1 or .>($tags|length)) then error("invalid selection")
+          else [.[] as $id|$tags[$id-1].tag]|unique end' 2>/dev/null); then
+            printf '%s\n' "$rows"
+            return 0
+        fi
+        echoContent yellow "$(socks5OutboundText '编号无效，请输入列表中的数字，以逗号分隔' 'Invalid selection; enter listed numbers separated by commas')" >&2
+    done
+}
+
+# Treat pasted JSON strictly as data, and reject malformed input before any transaction.
+socks5OutboundParseNode() {
+    jq -ecs '
+      if length != 1 or (.[0]|type) != "object" then error("invalid node") else .[0] end |
+      {server:.server,server_port:.server_port,username:(.username // ""),password:(.password // "")} |
+      if (.server|type=="string" and test("^[^[:space:]/]+$")) and
+         (.server_port|type=="number" and floor==. and .>=1 and .<=65535) and
+         (.username|type=="string" and length<=255 and (test("[[:cntrl:]]")|not)) and
+         (.password|type=="string" and length<=255 and (test("[[:cntrl:]]")|not)) and
+         ((.username=="")==(.password==""))
+      then . else error("invalid node") end' 2>/dev/null
+}
+
+socks5OutboundInputNode() {
+    echo
+    local name server port user pass='' id=$1 node connection core tags='[]' users defaults='[]' userDefaults='[]' old='null' temp
+    socks5OutboundRead name '落地机名称:' 'Node name:' || return 1
+    while true; do
+        socks5OutboundRead server '地址（IPv4/IPv6/域名，或粘贴入站的单行 JSON）:' 'Address (IPv4/IPv6/domain, or paste inbound single-line JSON):' silent || return 1
+        if [[ "$server" =~ ^[[:space:]]*\{ ]]; then
+            if ! connection=$(socks5OutboundParseNode <<<"$server"); then
+                socks5OutboundText '节点信息无效，请重新粘贴完整的单行 JSON' 'Invalid node; paste the complete single-line JSON again' >&2
+                continue
+            fi
+            server=$(jq -r '.server' <<<"$connection") || return 1
+            port=$(jq -r '.server_port' <<<"$connection") || return 1
+            user=$(jq -r '.username' <<<"$connection") || return 1
+            pass=$(jq -r '.password' <<<"$connection") || return 1
+        else
+            socks5OutboundRead port '端口:' 'Port:' || return 1
+            socks5OutboundRead user '用户名（空=无认证）:' 'Username (blank=no authentication):' || return 1
+            if [[ -n "$user" ]]; then
+                socks5OutboundRead pass '密码:' 'Password:' silent || return 1
+            fi
+        fi
+        break
+    done
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] && ((10#$port >= 1 && 10#$port <= 65535)) || return 1
     port=$((10#$port))
+    socks5OutboundChooseCore || return 1
+    core=$socks5SelectedCore
+    if [[ -n "$id" ]]; then
+        socks5OutboundPaths
+        temp=$(mktemp -d) || return 1
+        socks5OutboundLoad "$temp" || {
+            rm -rf "$temp"
+            return 1
+        }
+        old=$(jq -ec --arg id "$id" '.nodes[]|select(.id==$id)' "$temp/outbounds.json") || {
+            rm -rf "$temp"
+            return 1
+        }
+        rm -rf "$temp"
+        if [[ "$(jq -r '.inbound_core' <<<"$old")" == "$core" ]]; then
+            defaults=$(jq -c '.inbound_tags // []' <<<"$old") || return 1
+            userDefaults=$(jq -c '.user_refs // []' <<<"$old") || return 1
+        elif [[ "$(jq -r '.user_mode // "all"' <<<"$old")" == selected ]]; then
+            echoContent yellow "$(socks5OutboundText '此落地机已选择默认用户，修改核心前请先在原核心取消用户限制' 'This node has default users; remove them in the original core before switching cores')"
+            return 1
+        fi
+    fi
+    tags=$(socks5OutboundChooseTags "$core" "$defaults") || return 1
+    users=$(socks5OutboundChooseUsers "$core" "$tags" "$userDefaults") || return 1
     local editing=false
-    if [[ -n "$id" ]]; then editing=true
+    if [[ -n "$id" ]]; then
+        editing=true
     else id="node-$(date +%s)-$RANDOM"; fi
-    node=$(jq -n --arg id "$id" --arg name "$name" --arg server "$server" --argjson port "$port" \
-      --arg user "$user" --arg pass "$pass" '
-      {id:$id,name:$name,server:$server,server_port:$port,version:"5",username:$user,password:$pass,
-       core_tags:{"sing-box":("socks5_"+$id),xray:("socks5_"+$id)},enabled:true}') || return 1
+    node=$(jq -n --arg id "$id" --arg name "$name" --arg server "$server" --arg core "$core" --argjson port "$port" \
+        --arg user "$user" --arg pass "$pass" --argjson tags "$tags" --argjson users "$users" '
+      {id:$id,name:$name,server:$server,server_port:$port,version:"5",username:$user,password:$pass,inbound_tags:$tags,inbound_core:$core,
+       core_tags:{"sing-box":("socks5_"+$id),xray:("socks5_"+$id)},enabled:true}+$users') || return 1
     # Existing node tags must remain stable when credentials or display names change.
     socks5OutboundTransaction socks5OutboundEditNode "$node" "$editing"
 }
@@ -9777,6 +10561,10 @@ socks5OutboundEditNode() {
     if [[ "$old" != null ]]; then
         node=$(jq --argjson old "$old" '.core_tags=$old.core_tags | .legacy=($old.legacy // false) | .enabled=$old.enabled' <<<"$node") || return 1
     fi
+    local defaults core
+    core=$(jq -r '.inbound_core' <<<"$node") || return 1
+    defaults=$(jq -cn --argjson node "$node" '{routes:[$node+{core:$node.inbound_core}]}') || return 1
+    socks5OutboundCheckUsers "$defaults" "$core" || return 1
     socks5OutboundSaveNode "$state" "$node"
 }
 
@@ -9787,14 +10575,17 @@ socks5OutboundParseTargets() {
         item=$(printf '%s' "$item" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
         [[ -n "$item" ]] || continue
         case "$item" in
-        geosite:*|rule-set:*)
+        geosite:* | rule-set:*)
             item=${item#*:}
             [[ "$item" =~ ^[a-zA-Z0-9_@.!-]+$ ]] || return 1
-            sets=$(jq --arg item "$item" '.+[$item]|unique' <<<"$sets") || return 1 ;;
-        domain:*|full:*|regexp:*|keyword:*)
-            domains=$(jq --arg item "$item" '.+[$item]|unique' <<<"$domains") || return 1 ;;
-        *:*|*/*)
-            ips=$(jq --arg item "$item" '.+[$item]|unique' <<<"$ips") || return 1 ;;
+            sets=$(jq --arg item "$item" '.+[$item]|unique' <<<"$sets") || return 1
+            ;;
+        domain:* | full:* | regexp:* | keyword:*)
+            domains=$(jq --arg item "$item" '.+[$item]|unique' <<<"$domains") || return 1
+            ;;
+        *:* | */*)
+            ips=$(jq --arg item "$item" '.+[$item]|unique' <<<"$ips") || return 1
+            ;;
         *)
             if [[ "$item" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
                 ips=$(jq --arg item "$item" '.+[$item]|unique' <<<"$ips") || return 1
@@ -9804,44 +10595,89 @@ socks5OutboundParseTargets() {
                 # Preserve the existing short geosite-name interaction, without hardcoded catalogs.
                 catalog=$(getDLCGeositeName "$item" "$s5Root/$core" 2>/dev/null) || return 1
                 [[ -n "$catalog" ]] || {
-                    socks5OutboundText "规则集不存在，请使用 geosite:名称 或域名：$item" "Unknown rule set; use geosite:name or a domain: $item" >&2; return 1;
+                    socks5OutboundText "规则集不存在，请使用 geosite:名称 或域名：$item" "Unknown rule set; use geosite:name or a domain: $item" >&2
+                    return 1
                 }
                 sets=$(jq --arg item "$catalog" '.+[$item]|unique' <<<"$sets") || return 1
-            fi ;;
+            fi
+            ;;
         esac
     done < <(printf '%s\n' "$csv" | tr ',' '\n')
     jq -n --argjson domains "$domains" --argjson sets "$sets" --argjson ips "$ips" \
-      '{domains:$domains,rule_sets:$sets,ip_cidrs:$ips}'
+        '{domains:$domains,rule_sets:$sets,ip_cidrs:$ips}'
 }
 
 socks5OutboundInputRoute() {
-    local id=$1 tags scope targets='' node priority json choice
+    local id=$1 tags scope targets='' node priority json choice defaults temp selected status old='null' users userDefaults='[]'
+    if selected=$(socks5OutboundChooseItem nodes enabled); then
+        :
+    else
+        status=$?
+        [[ "$status" == 2 ]] && return 0
+        return 1
+    fi
+    node=$(jq -r '.id' <<<"$selected") || return 1
     socks5OutboundChooseCore || return 1
-    socks5InboundTagList "$socks5SelectedCore"
-    socks5OutboundRead tags '入站 tag（逗号多选，空=仅目标全局分流）:' 'Inbound tags (comma separated, blank=global target rule):' || return 1
-    json=$(jq -n --arg tags "$tags" '$tags|split(",")|map(gsub("^\\s+|\\s+$";""))|map(select(length>0))|unique') || return 1
-    if [[ "$json" != '[]' ]]; then
-        socks5OutboundRead choice '分流范围 [1=全部流量, 2=目标匹配]:' 'Scope [1=all traffic, 2=match targets]:' || return 1
+    socks5OutboundPaths
+    temp=$(mktemp -d) || return 1
+    socks5OutboundLoad "$temp" || {
+        rm -rf "$temp"
+        return 1
+    }
+    if [[ -n "$id" ]]; then
+        old=$(jq -ec --arg id "$id" '.routes[]|select(.id==$id)' "$temp/routes.json") || {
+            rm -rf "$temp"
+            return 1
+        }
+        userDefaults=$(jq -c '.user_refs // []' <<<"$old") || {
+            rm -rf "$temp"
+            return 1
+        }
+    fi
+    defaults=$(jq -er --arg id "$node" --arg core "$socks5SelectedCore" '
+      first(.nodes[]|select(.id==$id and .enabled)) |
+      if .==null then error("unknown node")
+      elif .inbound_core==$core then ((.inbound_tags // [])|tojson) else "[]" end' "$temp/outbounds.json") || {
+        rm -rf "$temp"
+        return 1
+    }
+    if [[ "$old" == null ]]; then
+        userDefaults=$(jq -c --arg id "$node" --arg core "$socks5SelectedCore" '
+          first(.nodes[]|select(.id==$id)) |
+          if .inbound_core==$core then (.user_refs // []) else [] end' "$temp/outbounds.json") || {
+            rm -rf "$temp"
+            return 1
+        }
+    fi
+    rm -rf "$temp"
+    if [[ "$old" != null && "$(jq -r '.core' <<<"$old")" == "$socks5SelectedCore" ]]; then
+        defaults=$(jq -c '.inbound_tags' <<<"$old") || return 1
+    elif [[ "$old" != null && "$userDefaults" != '[]' ]]; then
+        echoContent yellow "$(socks5OutboundText '此规则含用户条件，修改核心前请先在原核心取消用户限制' 'This rule has user conditions; remove them in the original core before switching cores')"
+        return 1
+    fi
+    tags=$(socks5OutboundChooseTags "$socks5SelectedCore" "$defaults") || return 1
+    users=$(socks5OutboundChooseUsers "$socks5SelectedCore" "$tags" "$userDefaults") || return 1
+    if [[ "$tags" != '[]' || "$(jq -r '.user_mode' <<<"$users")" == selected ]]; then
+        socks5OutboundRead choice '分流范围 [1=全部转发, 2=目标匹配]:' 'Scope [1=all traffic, 2=match targets]:' || return 1
         case "$choice" in 1) scope=all ;; 2) scope=match ;; *) return 1 ;; esac
     else scope=target_only; fi
     if [[ "$scope" != all ]]; then
         socks5OutboundRead targets '域名/geosite:名称/IP/CIDR（逗号分隔）:' 'Domains/geosite:name/IP/CIDR (comma separated):' || return 1
         [[ -n "$targets" ]] || return 1
     fi
-    socks5OutboundView || return 1
-    socks5OutboundRead node '落地机 ID:' 'Node ID:' || return 1
     socks5OutboundRead priority '优先级 [默认100，数字越小越优先]:' 'Priority [100; smaller first]:' || return 1
     priority=${priority:-100}
     [[ "$priority" =~ ^[0-9]{1,7}$ ]] || return 1
     priority=$((10#$priority))
     targets=$(socks5OutboundParseTargets "$targets" "$socks5SelectedCore") || return 1
     local editing=false
-    if [[ -n "$id" ]]; then editing=true
+    if [[ -n "$id" ]]; then
+        editing=true
     else id="route-$(date +%s)-$RANDOM"; fi
     json=$(jq -n --arg id "$id" --arg core "$socks5SelectedCore" --arg scope "$scope" \
-      --argjson tags "$json" --argjson target "$targets" --arg node "$node" --argjson priority "$priority" '
-      {id:$id,core:$core,scope:$scope,inbound_tags:$tags,outbound_node:$node,priority:$priority,enabled:true}+$target') || return 1
-    printf '%s\n' "$json"
+        --argjson tags "$tags" --argjson target "$targets" --argjson users "$users" --arg node "$node" --argjson priority "$priority" '
+      {id:$id,core:$core,scope:$scope,inbound_tags:$tags,outbound_node:$node,priority:$priority,enabled:true}+$target+$users') || return 1
     socks5OutboundTransaction socks5OutboundSaveRoute "$json" "$editing"
 }
 
@@ -9849,7 +10685,7 @@ socks5OutboundTestNode() (
     set -o pipefail
     umask 077
     socks5OutboundPaths
-    local id=$1 temp node address
+    local id=$1 temp node address result exitIP
     temp=$(mktemp -d) || return 1
     trap 'rm -rf "$temp"' EXIT
     socks5OutboundLoad "$temp" || return 1
@@ -9862,47 +10698,45 @@ socks5OutboundTestNode() (
       (if $node.username!="" then "proxy-user = "+(($node.username+":"+$node.password)|@json) else empty end),
       "url = \"https://www.cloudflare.com/cdn-cgi/trace\"",
       "connect-timeout = 10","max-time = 15","silent","show-error","fail"' >"$temp/curl.conf" || return 1
-    curl --config "$temp/curl.conf" | sed -n '/^ip=/p'
+    result=$(curl --config "$temp/curl.conf") || return 1
+    exitIP=$(sed -n 's/^ip=//p' <<<"$result")
+    [[ -n "$exitIP" ]] || return 1
+    echoContent green "$(socks5OutboundText '出口 IP:' 'Exit IP:') $exitIP"
+    echoContent green " ---> $(socks5OutboundText '节点测试完成' 'Node test completed')"
+    echo
 )
 
 socks5OutboundRoutingMenu() {
-    local choice id node
+    local choice status
     while true; do
-        socks5OutboundText '
-Socks5 出站
-1.添加落地机  2.查看节点和规则  3.添加分流规则
-4.编辑节点    5.删除节点        6.编辑规则
-7.删除规则    8.设置全局默认    9.测试节点
-10.卸载出站   11.启停节点或规则   0.返回' '
-Socks5 outbound
-1.Add node   2.Show nodes/rules  3.Add route
-4.Edit node  5.Delete node       6.Edit route
-7.Delete route  8.Global default 9.Test node
-10.Uninstall outbound  11.Enable/disable node or rule  0.Back'
+        echo
+        echoContent skyBlue "$(socks5OutboundText ' ---> SOCKS5 出站' 'SOCKS5 outbound')"
+        echo
+        if socks5OutboundInstalled; then
+            echoContent yellow "$(socks5OutboundText '1.添加落地机  2.查看配置  3.添加规则' '1.Add node  2.View configuration  3.Add route')"
+            echoContent yellow "$(socks5OutboundText '4.节点管理    5.规则管理  6.更多操作' '4.Manage nodes  5.Manage routes  6.More actions')"
+        else
+            status=$?
+            [[ "$status" == 1 ]] || return 1
+            echoContent yellow "$(socks5OutboundText '1.添加落地机' '1.Add node')"
+        fi
+        echoContent yellow "$(socks5OutboundText '0.返回' '0.Back')"
         socks5OutboundRead choice '请选择:' 'Select:' || return 0
+        case "$choice" in
+        2 | 3 | 4 | 5 | 6) socks5OutboundRequireInstalled || continue ;;
+        esac
         case "$choice" in
         1) socks5OutboundInputNode '' ;;
         2) socks5OutboundView ;;
         3) socks5OutboundInputRoute '' ;;
-        4) socks5OutboundView; socks5OutboundRead id '节点 ID:' 'Node ID:' && socks5OutboundInputNode "$id" ;;
-        5) socks5OutboundView; socks5OutboundRead id '节点 ID:' 'Node ID:' && socks5OutboundTransaction socks5OutboundDelete node "$id" ;;
-        6) socks5OutboundView; socks5OutboundRead id '规则 ID:' 'Route ID:' && socks5OutboundInputRoute "$id" ;;
-        7) socks5OutboundView; socks5OutboundRead id '规则 ID:' 'Route ID:' && socks5OutboundTransaction socks5OutboundDelete route "$id" ;;
-        8)
-            socks5OutboundChooseCore && socks5OutboundView || continue
-            socks5OutboundRead node '默认落地机 ID（空=恢复原默认）:' 'Default node ID (blank=restore previous default):' &&
-                socks5OutboundTransaction socks5OutboundSetDefault "$socks5SelectedCore" "$node" ;;
-        9) socks5OutboundRead id '节点 ID:' 'Node ID:' && socks5OutboundTestNode "$id" ;;
-        10)
-            socks5OutboundRead choice '卸载全部 Socks5 出站和规则？[y/n]:' 'Remove all Socks5 outbounds and routes? [y/n]:' || continue
-            [[ "$choice" != y ]] || socks5OutboundTransaction socks5OutboundEmpty ;;
-        11)
-            socks5OutboundView || continue
-            socks5OutboundRead choice '类型 [node/route]:' 'Type [node/route]:' || continue
-            [[ "$choice" == node || "$choice" == route ]] || continue
-            socks5OutboundRead id 'ID:' 'ID:' && socks5OutboundTransaction socks5OutboundToggle "$choice" "$id" ;;
-        0|'') return 0 ;;
-        *) continue ;;
+        4) socks5OutboundManage nodes ;;
+        5) socks5OutboundManage routes ;;
+        6) socks5OutboundMoreMenu ;;
+        0 | '') return 0 ;;
+        *)
+            echoContent yellow "$(socks5OutboundText '编号无效，请重新输入' 'Invalid number; try again')"
+            continue
+            ;;
         esac
         [[ $? == 0 ]] || socks5OutboundText '操作未完成，现有配置已保留' 'Operation did not complete; existing configuration preserved' >&2
     done
@@ -9912,15 +10746,28 @@ setSocks5Outbound() { socks5OutboundInputNode ''; }
 setSocks5OutboundRouting() { socks5OutboundInputRoute ''; }
 # Keep generated routes current when other script menus change routing fragments.
 socks5OutboundPrepareSingBoxMerged() (
-    local config=$1 work=$2 candidate=${3:-} modern
+    local config=$1 work=$2 candidate=${3:-} modern routes
     socks5OutboundPaths
     candidate=${candidate:-$s5SB}
     [[ -f "$s5State/outbounds.json" && -f "$s5State/routes.json" ]] || return 0
+    routes=$(socks5OutboundReadRoutes "$s5State/routes.json") || return 1
+    socks5OutboundCheckUsers "$routes" sing-box "$candidate" || return 1
     modern=$(socks5OutboundModern) || return 1
     socks5OutboundBuild sing-box "$s5State" "$modern" >"$work/sing-box-compiled.json" || return 1
     socks5OutboundJsonWrite "$work/sing-box-compiled.json" --slurpfile cfg "$config" \
-      '.guard_tags=[$cfg[0].outbounds[]?|select(.type=="block")|.tag]' || return 1
+        '.guard_tags=[$cfg[0].outbounds[]?|select(.type=="block")|.tag]' || return 1
     socks5OutboundNormalizeSingBox "$config" "$work/sing-box-compiled.json" "$work" "$candidate/00_socks5_guard.json"
+)
+
+socks5OutboundAllowReinstall() (
+    local routes
+    socks5OutboundPaths
+    [[ -f "$s5State/routes.json" ]] || return 0
+    routes=$(socks5OutboundReadRoutes "$s5State/routes.json") || return 1
+    if jq -e 'any(.routes[]; (.inbound_tags|length)>0 or .user_mode=="selected")' <<<"$routes" >/dev/null; then
+        socks5OutboundText '请先解除 SOCKS5 分流对入站和用户的绑定，再重新安装或切换核心。' 'Remove SOCKS5 inbound and user bindings before reinstalling or switching cores.' >&2
+        return 1
+    fi
 )
 
 socks5OutboundRefreshXray() (
@@ -9931,7 +10778,8 @@ socks5OutboundRefreshXray() (
     work=$(mktemp -d "$s5State/.refresh.XXXXXX") || return 1
     trap 'rm -rf "$work"' EXIT
     mkdir "$work/state" "$work/before" "$work/xr" || return 1
-    cp -p "$s5State/outbounds.json" "$s5State/routes.json" "$work/state/" || return 1
+    socks5OutboundLoad "$work/state" || return 1
+    socks5OutboundValidate "$work/state" xray || return 1
     cp -p "$work/state/"*.json "$work/before/" || return 1
     cp -p "$s5XR/"*.json "$work/xr/" || return 1
     socks5OutboundStage "$work" || return 1
@@ -9940,7 +10788,6 @@ socks5OutboundRefreshXray() (
     done
 )
 # End SOCKS5 outbound implementation
-
 
 # socks5 分流规则
 showSingBoxRoutingRules() {
@@ -10160,6 +11007,25 @@ removeVMessWSRouting() {
 
 # 重启核心
 reloadCore() {
+    # An explicit list keeps staged SOCKS5 changes and rollback on the same cores.
+    if [[ "${1:-}" == transaction && $# -gt 1 ]]; then
+        shift
+        local core
+        for core in "$@"; do
+            case "$core" in
+            xray)
+                handleXray stop transaction || return 1
+                handleXray start transaction staged || return 1
+                ;;
+            sing-box)
+                handleSingBox stop transaction || return 1
+                handleSingBox start transaction staged || return 1
+                ;;
+            *) return 1 ;;
+            esac
+        done
+        return 0
+    fi
     readInstallType
 
     if [[ "${coreInstallType}" == "1" ]]; then
@@ -10522,9 +11388,9 @@ customSingBoxInstall() {
         fi
 
         installSingBox 4 || return 1
-        installSingBoxService 5
+        installSingBoxService 5 || return 1
         initSingBoxConfig custom 6 || return 1
-        cleanUp xrayDel
+        cleanUp xrayDel || return 1
         installCronTLS 7
         handleSingBox stop
         handleSingBox start
@@ -10551,9 +11417,9 @@ installXrayReality() {
 
     # 安装Xray
     installXray 2 false || return 1
-    installXrayService 3
-    initXrayConfig custom 4
-    cleanUp singBoxDel
+    installXrayService 3 || return 1
+    initXrayConfig custom 4 || return 1
+    cleanUp singBoxDel || return 1
 
     handleXray stop
     handleXray start
@@ -10571,9 +11437,9 @@ installSingBoxReality() {
     installTools 1 || return 1
 
     installSingBox 2 || return 1
-    installSingBoxService 3
+    installSingBoxService 3 || return 1
     initSingBoxConfig custom 4 || return 1
-    cleanUp xrayDel
+    cleanUp xrayDel || return 1
     handleSingBox stop
     handleSingBox start
     # 生成账号
@@ -10635,8 +11501,10 @@ customXrayInstall() {
         if echo "${selectCustomInstallType}" | grep -qE ",1,|,2,|,3,|,5,|,12,|,14,"; then
             randomPathFunction 4
         fi
-        if [[ -n "${btDomain}" ]] || ! xraySelectionNeedsNginx "${selectCustomInstallType}"; then
+        if [[ -n "${btDomain}" ]]; then
             echoContent skyBlue "\n进度  6/${totalProgress} : 检测到宝塔面板/1Panel，跳过伪装网站"
+        elif ! xraySelectionNeedsNginx "${selectCustomInstallType}"; then
+            echoContent skyBlue "\n进度  6/${totalProgress} : 所选协议无需Nginx，跳过伪装网站"
         else
             nginxBlog 6
         fi
@@ -10647,10 +11515,12 @@ customXrayInstall() {
 
         # 安装Xray
         installXray 7 false || return 1
-        installXrayService 8
-        initXrayConfig custom 9 true
+        installXrayService 8 || return 1
+        # A custom installation is a replacement: remove protocol fragments
+        # that are not part of the new selection.
+        initXrayConfig custom 9 || return 1
         if ! [[ "${selectCustomInstallType}" == *,6,* && -f /etc/v2ray-agent/sing-box/conf/config.json ]]; then
-            cleanUp singBoxDel
+            cleanUp singBoxDel || return 1
         fi
         if xraySelectionNeedsCertificate "${selectCustomInstallType}"; then
             installCronTLS 10
@@ -10669,6 +11539,7 @@ customXrayInstall() {
 
 # 选择核心安装sing-box、xray-core
 selectCoreInstall() {
+    socks5OutboundAllowReinstall || return 1
     echoContent skyBlue "\n功能 1/${totalProgress} : 选择核心安装"
     echoContent red "\n=============================================================="
     echoContent yellow "1.Xray-core"
@@ -10735,9 +11606,9 @@ xrayCoreInstall() {
 
     # 安装Xray
     installXray 6 false || return 1
-    installXrayService 7
-    initXrayConfig all 8
-    cleanUp singBoxDel
+    installXrayService 7 || return 1
+    initXrayConfig all 8 || return 1
+    cleanUp singBoxDel || return 1
     installCronTLS 9
     if [[ -n "${btDomain}" ]]; then
         echoContent skyBlue "\n进度  11/${totalProgress} : 检测到宝塔面板/1Panel，跳过伪装网站"
@@ -10779,10 +11650,10 @@ singBoxInstall() {
     handleNginx stop || return 1
 
     installSingBox 5 || return 1
-    installSingBoxService 6
+    installSingBoxService 6 || return 1
     initSingBoxConfig all 7 || return 1
 
-    cleanUp xrayDel
+    cleanUp xrayDel || return 1
     installCronTLS 8
 
     handleSingBox stop
@@ -10820,7 +11691,10 @@ cronFunction() {
         renewalTLS
         exit 0
     elif [[ "${cronName}" == "UpdateGeo" ]]; then
-        updateGeoSite >>/etc/v2ray-agent/crontab_updateGeoSite.log
+        if ! updateGeoSite >>/etc/v2ray-agent/crontab_updateGeoSite.log 2>&1; then
+            echoContent red " ---> geo更新失败:$(date "+%F %H:%M:%S")" >>/etc/v2ray-agent/crontab_updateGeoSite.log
+            exit 1
+        fi
         echoContent green " ---> geo更新日期:$(date "+%F %H:%M:%S")" >>/etc/v2ray-agent/crontab_updateGeoSite.log
         exit 0
     fi
@@ -10871,11 +11745,69 @@ viewAccountsByUser() {
     users=$(collectAccountUsers) || return 1
     selectAccountUser "${users}" || return 0
     tempDir=$(mktemp -d) || return 1
-    chmod 700 "${tempDir}" || { rm -rf "${tempDir}"; return 1; }
+    chmod 700 "${tempDir}" || {
+        rm -rf "${tempDir}"
+        return 1
+    }
     (
         trap 'rm -rf "${tempDir}"' EXIT
         showAccounts 1 "${accountSelectionKey}" "${tempDir}"
     )
+}
+
+# Shared subscription presentation for viewing and generation.
+showUserSubscriptions() {
+    local subscriptionUser=$1 emailMd5=$2 currentDomain=$3
+    local publishDir=$4 subscriptionScheme=$5
+    local format file subscriptionURL title description index=0
+    local -a availableFormats=()
+    for format in default clashMetaProfiles sing-box; do
+        file="${publishDir}/${format}/${emailMd5}"
+        [[ -s "${file}" ]] && availableFormats+=("${format}")
+    done
+    echoContent skyBlue "=============================================================="
+    echoContent brightPurple "\n用户订阅"
+    printf '\n用户 \033[93m%s\033[0m  /  可用订阅 \033[93m%s\033[0m 种' "${subscriptionUser}" "${#availableFormats[@]}"
+    if [[ ${#availableFormats[@]} -eq 0 ]]; then
+        echoContent yellow "  该用户尚无已生成的订阅文件，请先使用 6.生成/更新订阅。"
+        return 1
+    fi
+    for format in "${availableFormats[@]}"; do
+        index=$((index + 1))
+        case "${format}" in
+        default)
+            title="通用订阅"
+            description="适用于 v2rayN、v2rayNG 等客户端"
+            ;;
+        clashMetaProfiles)
+            title="Mihomo 订阅"
+            description="适用于 Clash Verge Rev 等客户端"
+            ;;
+        sing-box)
+            title="sing-box 订阅"
+            description="适用于 sing-box 客户端"
+            ;;
+        esac
+        echo
+        echoContent white "=============================================================="
+        printf '\033[95m%02d\033[0m  ' "${index}"
+        echoContent skyBlue "${title}"
+        echoContent gray "${description}"
+        echo
+        subscriptionURL="${subscriptionScheme}://${currentDomain}/s/${format}/${emailMd5}"
+        echoContent gold "订阅链接\n"
+        echoContent brightGreen "${subscriptionURL}"
+        echo
+        if [[ "${release}" != "alpine" ]] && command -v qrencode >/dev/null 2>&1; then
+            printf '%s\n' "${subscriptionURL}" | qrencode -s 10 -m 1 -t UTF8
+            echo
+        fi
+        echoContent gold "在线二维码\n"
+        echoContent brightGreen "https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${subscriptionURL}"
+    done
+    echo
+    echoContent gray "复制链接或扫描二维码导入，请妥善保管订阅链接。"
+
 }
 
 viewSubscriptionByUser() {
@@ -10885,10 +11817,11 @@ viewSubscriptionByUser() {
     selectAccountUser "${users}" || return 0
     readNginxSubscribe
     if [[ -z "${subscribePort}" || ! -f /etc/v2ray-agent/subscribe_local/subscribeSalt ]]; then
-        echoContent red " ---> 尚未初始化订阅服务，请先使用 6.生成/更新订阅。"
-        return 1
+        echoContent yellow " ---> 尚未初始化订阅服务，正在生成/更新订阅。"
+        subscribe || return 1
+        readNginxSubscribe
     fi
-    local subscribeSalt emailMd5 currentDomain publishDir format file formatFound=false
+    local subscribeSalt emailMd5 currentDomain publishDir
     subscribeSalt=$(cat /etc/v2ray-agent/subscribe_local/subscribeSalt) || return 1
     emailMd5=$(printf '%s\n' "${accountSelectionKey}${subscribeSalt}" | md5sum | awk '{print $1}')
     currentDomain=${currentHost}
@@ -10902,20 +11835,7 @@ viewSubscriptionByUser() {
         currentDomain="${currentHost}:${currentDefaultPort}"
     fi
     publishDir=/etc/v2ray-agent/subscribe
-    for format in default clashMetaProfiles sing-box; do
-        file="${publishDir}/${format}/${emailMd5}"
-        [[ -s "${file}" ]] || continue
-        case "${format}" in
-        default) echoContent yellow "默认订阅: ${subscribeType}://${currentDomain}/s/default/${emailMd5}" ;;
-        clashMetaProfiles) echoContent yellow "Mihomo 订阅: ${subscribeType}://${currentDomain}/s/clashMetaProfiles/${emailMd5}" ;;
-        sing-box) echoContent yellow "sing-box 订阅: ${subscribeType}://${currentDomain}/s/sing-box/${emailMd5}" ;;
-        esac
-        formatFound=true
-    done
-    if [[ "${formatFound}" != true ]]; then
-        echoContent yellow " ---> 该用户尚无已生成的订阅文件，请先使用 6.生成/更新订阅。"
-        return 1
-    fi
+    showUserSubscriptions "${accountSelectionKey}" "${emailMd5}" "${currentDomain}" "${publishDir}" "${subscribeType}"
 }
 
 # 安装订阅
@@ -10941,6 +11861,7 @@ installSubscribe() {
                 exit 0
             fi
         fi
+        echo
         echoContent yellow "开始配置订阅，请输入订阅的端口\n"
 
         mapfile -t result < <(initSingBoxPort "${subscribePort}")
@@ -11604,37 +12525,7 @@ subscribe() (
                     rm -f "${subscribePublishPath}/sing-box/${emailMd5}_download"
                 fi
                 if [[ -z "${showStatus}" ]]; then
-                    echoContent skyBlue "\n----------默认订阅----------\n"
-                    echoContent green "email:${email}\n"
-                    echoContent yellow "url:${subscribeType}://${currentDomain}/s/default/${emailMd5}\n"
-                    echoContent yellow "在线二维码:https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${subscribeType}://${currentDomain}/s/default/${emailMd5}\n"
-                    if [[ "${release}" != "alpine" ]]; then
-                        echo "${subscribeType}://${currentDomain}/s/default/${emailMd5}" | qrencode -s 10 -m 1 -t UTF8
-                    fi
-
-                    # clashMeta
-                    if [[ -f "/etc/v2ray-agent/subscribe_local/clashMeta/${email}" ]]; then
-
-                        echoContent skyBlue "\n----------clashMeta订阅----------\n"
-                        echoContent yellow "url:${subscribeType}://${currentDomain}/s/clashMetaProfiles/${emailMd5}\n"
-                        echoContent yellow "在线二维码:https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${subscribeType}://${currentDomain}/s/clashMetaProfiles/${emailMd5}\n"
-                        if [[ "${release}" != "alpine" ]]; then
-                            echo "${subscribeType}://${currentDomain}/s/clashMetaProfiles/${emailMd5}" | qrencode -s 10 -m 1 -t UTF8
-                        fi
-
-                    fi
-                    # sing-box
-                    if [[ -f "/etc/v2ray-agent/subscribe_local/sing-box/${email}" ]]; then
-                        echoContent skyBlue "\n----------sing-box订阅----------\n"
-                        echoContent yellow "url:${subscribeType}://${currentDomain}/s/sing-box/${emailMd5}"
-                        echoContent yellow "在线二维码:https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${subscribeType}://${currentDomain}/s/sing-box/${emailMd5}"
-                        if [[ "${release}" != "alpine" ]]; then
-                            echo "${subscribeType}://${currentDomain}/s/sing-box/${emailMd5}" | qrencode -s 10 -m 1 -t UTF8
-                        fi
-
-                    fi
-
-                    echoContent skyBlue "--------------------------------------------------------------"
+                    showUserSubscriptions "${email}" "${emailMd5}" "${currentDomain}" "${subscribePublishPath}" "${subscribeType}" || return 1
                 else
                     echoContent green " ---> email:${email}，订阅已更新，请使用客户端重新拉取"
                 fi
@@ -12129,34 +13020,6 @@ realityScanner() {
         echoContent red " ---> 无法读取正确IP"
     fi
 }
-# hysteria管理
-manageHysteria() {
-    if [[ "${webBackend:-}" == onepanel ]]; then echoContent yellow "1Panel 后端目前管理 Xray 协议；Hysteria2/TUIC 请使用独立模式"; return 0; fi
-    echoContent skyBlue "\n进度  1/1 : Hysteria2 管理"
-    echoContent red "\n=============================================================="
-    local hysteria2Status=
-    if [[ -n "${singBoxConfigPath}" ]] && [[ -f "/etc/v2ray-agent/sing-box/conf/config/06_hysteria2_inbounds.json" ]]; then
-        echoContent yellow "依赖第三方sing-box\n"
-        echoContent yellow "1.重新安装"
-        echoContent yellow "2.卸载"
-        echoContent yellow "3.端口跳跃管理"
-        hysteria2Status=true
-    else
-        echoContent yellow "依赖sing-box内核\n"
-        echoContent yellow "1.安装"
-    fi
-
-    echoContent red "=============================================================="
-    read -r -p "请选择:" installHysteria2Status
-    if [[ "${installHysteria2Status}" == "1" ]]; then
-        singBoxHysteria2Install
-    elif [[ "${installHysteria2Status}" == "2" && "${hysteria2Status}" == "true" ]]; then
-        unInstallSingBox hysteria2
-    elif [[ "${installHysteria2Status}" == "3" && "${hysteria2Status}" == "true" ]]; then
-        portHoppingMenu hysteria2
-    fi
-}
-
 # tuic管理
 manageTuic() {
     if [[ "${webBackend:-}" == onepanel ]]; then echoContent yellow "1Panel 后端目前管理 Xray 协议；Hysteria2/TUIC 请使用独立模式"; return 0; fi
@@ -12238,8 +13101,11 @@ singBoxVersionManageMenu() {
     fi
     if [[ -f "${singBoxConfigPath}00_socks5_guard.json" ]]; then
         case "${selectSingBoxType}" in
-        2) socks5SingBoxService stop; return $? ;;
-        3|4)
+        2)
+            socks5SingBoxService stop
+            return $?
+            ;;
+        3 | 4)
             /etc/v2ray-agent/sing-box/sing-box check -c /etc/v2ray-agent/sing-box/conf/config.json || return 1
             if [[ "${selectSingBoxType}" == 4 ]]; then socks5SingBoxService stop || return 1; fi
             socks5SingBoxService start || return 1
@@ -12275,7 +13141,7 @@ menu() {
     cd "$HOME" || exit
     echoContent red "\n=============================================================="
     echoContent green "作者：mack-a"
-    echoContent green "当前版本：v3.5.37"
+    echoContent green "当前版本：v3.5.41"
     echoContent green "Github：https://github.com/mack-a/v2ray-agent"
     echoContent green "描述：八合一共存脚本\c"
     showInstallStatus
@@ -12382,7 +13248,6 @@ menu() {
         ;;
     esac
 }
-
 
 cronFunction
 menu

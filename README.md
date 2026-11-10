@@ -2,7 +2,7 @@
 
 本仓库是 [mack-a/v2ray-agent](https://github.com/mack-a/v2ray-agent) 的 1Panel 兼容分支。中文入口 `install.sh` 保留独立 Nginx 模式，并在选择 Xray-core 后提供 **1Panel OpenResty** 安装模式。英文入口和独立 sing-box 安装流程保持上游行为。
 
-上游功能补丁已同步至 `v3.5.37`（`140b165`），保留本 fork 的 1Panel 后端和原有测试。新增 Xray 原生 Hysteria2 沿用独立模式；1Panel 模式的协议范围保持不变。
+上游功能补丁已同步至 `v3.5.41`（`b407b5e`），保留本 fork 的 1Panel 后端和原有测试。Xray 原生 Hysteria2 沿用独立模式；1Panel 模式的协议范围保持不变。
 
 ## 1Panel OpenResty 模式
 
@@ -21,7 +21,7 @@ bash /root/install.sh
 
 **证书由 1Panel 续期**。证书目录发生变化后，安装器配置的 systemd 任务校验证书域名、有效期和私钥配对，部署到 Xray 的固定路径，并核对 OpenResty 实际提供的证书。证书不变时不会重复重启 Xray；部署失败会保留原 Xray 证书，五分钟后重试。新证书载入需要重启 Xray，现有代理连接会短暂中断。原 vasma 的 ACME 续期任务会移除。
 
-用户与订阅管理继续使用 `vasma`。重新安装会沿用所选模式；需要改变节点端口时再次运行安装流程。1Panel 模式只管理 Xray，sing-box/Hysteria2/TUIC 请使用原独立模式。核心版本与 Web 模式独立选择，重新安装默认保留现有核心版本；旧客户端可自行选择兼容发行版，例如 `v26.3.27`。本模式不会消除新旧 REALITY 客户端的握手差异。
+用户与订阅管理继续使用 `vasma`。重新安装会沿用所选模式；需要改变节点端口时再次运行安装流程。1Panel 模式只管理 Xray，sing-box/Hysteria2/TUIC 请使用原独立模式。如已配置绑定入站或用户的 SOCKS5 分流规则，重新安装或切换核心前需先解除这些绑定。核心版本与 Web 模式独立选择，重新安装默认保留现有核心版本；旧客户端可自行选择兼容发行版，例如 `v26.3.27`。本模式不会消除新旧 REALITY 客户端的握手差异。
 
 此分支没有迁移平台或额外的升级、回滚管理器。脚本自身更新从本 fork 获取，后端模块按内嵌 SHA-256 校验后加载。公网 IPv4 地址发生变化后需重新安装以更新 TCP 监听地址。卸载代理时保留面板网站、证书及网站的 443 转发入口。
 
@@ -98,6 +98,8 @@ vasmad
 ```
 
 ## 文档和指南
+
+*   [SOCKS5 入站与分流出站：简明教程](https://www.v2ray-agent.com/archives/01a1b212-d16c-743c-a4b1-d6150a948bda)
 
 *   [八合一脚本从入门到精通](https://www.v2ray-agent.com/archives/1710141233)
 *   [脚本快速搭建教程](https://www.v2ray-agent.com/archives/1682491479771)

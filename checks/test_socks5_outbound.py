@@ -103,9 +103,11 @@ class Fixture:
         self.ports = {}
         self.engine = Path(parent) / 'engine.sh'
         text = (REPO / 'install.sh').read_text()
-        text = text[text.index('# SOCKS5 outbound state, compiler'):]
-        text = text[:text.index('# End SOCKS5 outbound implementation')]
-        self.engine.write_text(text)
+        start = text.index('# SOCKS5 outbound state, compiler')
+        end = text.index('# End SOCKS5 outbound implementation')
+        reload_start = text.index('\nreloadCore() {\n') + 1
+        reload_end = text.index('\n}\n', reload_start) + 3
+        self.engine.write_text(text[start:end] + '\n' + text[reload_start:reload_end])
         for core in cores:
             binary = SB if core == 'sing-box' else XR
             folder = self.root / core
@@ -155,7 +157,10 @@ class Fixture:
 
     def run(self, command, check=True, extra=''):
         result = subprocess.run(['bash', '-c', 'source "$1"; socks5OutboundRoot=$2; '
-                                 'socks5OutboundReload(){ return 0; }; ' + extra + command,
+                                 'socks5OutboundReload(){ return 0; }; '
+                                 'handleXray(){ if [[ "$1" == start ]]; then socks5OutboundReload xray; fi; }; '
+                                 'handleSingBox(){ if [[ "$1" == start ]]; then socks5OutboundReload sing-box; fi; }; '
+                                 + extra + command,
                                  '_', str(self.engine), str(self.root)], text=True, capture_output=True)
         if check and result.returncode:
             raise AssertionError(result.stdout + result.stderr)
@@ -218,6 +223,17 @@ class StateTests(unittest.TestCase):
             self.f.routes['routes'] = routes
             self.f.save()
             self.assertNotEqual(0, self.f.run('socks5OutboundPaths; socks5OutboundValidate "$s5State"', check=False).returncode)
+
+    def test_xray_refresh_and_reinstall_handle_stale_core_bindings(self):
+        self.f.routes['routes'] = [Fixture.route('sing-box', tags=['missing'])]
+        self.f.save()
+        validate = 'socks5OutboundPaths; socks5OutboundValidate "$s5State"'
+        self.assertNotEqual(0, self.f.run(validate, check=False).returncode)
+        self.assertEqual(0, self.f.run(validate + ' xray').returncode)
+        self.assertNotEqual(0, self.f.run('socks5OutboundAllowReinstall', check=False).returncode)
+        self.f.routes['routes'] = []
+        self.f.save()
+        self.assertEqual(0, self.f.run('socks5OutboundAllowReinstall').returncode)
 
     def test_english_engine_has_same_logic(self):
         def block(path):
