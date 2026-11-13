@@ -27,6 +27,11 @@ def context(root):
                 ports={'0': 777, '7': 443, '12': 555, '14': 666})
 
 
+def shared_context(root):
+    return dict(context(root), schema=2, web_port=443, subscription_website_id=4,
+                subscription_domain='subscription.example.test', subscription_alias='sub', subscription_port=888)
+
+
 def shell_function(name):
     s = (ROOT / 'install.sh').read_text()
     m = re.search(r'^' + re.escape(name) + r'\(\)\s*([({])', s, re.M)
@@ -35,6 +40,20 @@ def shell_function(name):
 
 
 class StateTests(unittest.TestCase):
+    def test_shared_443_ports_and_domain_are_independent(self):
+        c = shared_context(Path('/tmp/example'))
+        c['ports']['6'] = 777  # The same number is valid on TCP and UDP.
+        self.assertEqual(ctl.validate_state(c), c)
+        for key, value in [('0', 443), ('6', 443), ('14', 888), ('7', ctl.STREAM_PORT)]:
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                ctl.validate_state(dict(c, ports=dict(c['ports'], **{key: value})))
+        stream = ctl.stream_config(c, True)
+        self.assertIn(f'proxy.example.test 127.0.0.1:{ctl.REALITY_GATE_PORT}', stream)
+        self.assertIn('default 127.0.0.1:443;', stream)
+        self.assertIn('proxy_protocol on;', stream)
+        self.assertNotIn(c['listen_ipv4'], ctl.shared_entry_rules(True))
+        self.assertIn('fib daddr type local', ctl.shared_entry_rules(True))
+
     def test_valid_and_rejected_state(self):
         with tempfile.TemporaryDirectory() as t:
             c = context(Path(t))
@@ -97,6 +116,71 @@ class StateTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_shared_routing_survives_fragment_overrides_and_repeated_normalization(self):
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            c = shared_context(root)
+            agent = root / 'agent'
+            conf = agent / 'xray/conf'
+            conf.mkdir(parents=True)
+            configs = {
+                '07_VLESS_vision_reality_inbounds.json': {
+                    'inbounds': [{'port': 443, 'tag': 'dokodemo-in-VLESSReality', 'sniffing': {'enabled': True}},
+                                 {'port': 45987, 'streamSettings': {'security': 'reality', 'realitySettings': {}}}],
+                    'routing': {'rules': [{'inboundTag': ['dokodemo-in']}]},
+                },
+                '09_routing.json': {'routing': {'rules': [{'domain': ['example.test'], 'outboundTag': 'direct'}]}},
+                '14_VLESS_XHTTP_TLS_inbounds.json': {'routing': {'rules': [{'inboundTag': ['dokodemo-in-VLESSXHTTPTLS']}]}},
+                'z_direct_outbound.json': {'outbounds': [{'protocol': 'freedom', 'tag': 'direct', 'settings': {'domainStrategy': 'UseIP'}}]},
+            }
+            for name, config in configs.items():
+                (conf / name).write_text(json.dumps(config))
+            backend = ctl.Backend()
+            with patch.object(ctl, 'AGENT', agent), patch.object(ctl, 'run'), patch.object(backend, 'reload'):
+                backend.normalize_xray(c)
+                backend.normalize_xray(c)
+            gate = json.loads((conf / '07_VLESS_vision_reality_inbounds.json').read_text())
+            self.assertNotIn('routing', gate)
+            self.assertEqual(gate['inbounds'][0]['port'], ctl.REALITY_GATE_PORT)
+            self.assertEqual(gate['inbounds'][1]['streamSettings']['realitySettings']['xver'], 1)
+            self.assertNotIn('routing', json.loads((conf / '14_VLESS_XHTTP_TLS_inbounds.json').read_text()))
+            rules = json.loads((conf / '09_routing.json').read_text())['routing']['rules']
+            self.assertEqual(len(rules), 3)
+            self.assertEqual(rules[0]['inboundTag'], ['dokodemo-in-VLESSReality'])
+            outbounds = json.loads((conf / 'z_direct_outbound.json').read_text())['outbounds']
+            self.assertEqual(len(outbounds), 2)
+            self.assertEqual(outbounds[1]['settings']['proxyProtocol'], 1)
+
+    def test_only_whitelisted_subscription_files_are_published(self):
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            c = shared_context(root)
+            agent = root / 'agent'
+            for fmt in ctl.FORMATS.split('|'):
+                (agent / 'subscribe' / fmt).mkdir(parents=True)
+            default = agent / 'subscribe/default'
+            digest = 'a' * 32
+            (default / digest).write_text('fixture subscription')
+            (default / 'private').write_text('never copy')
+            (default / ('b' * 32)).symlink_to('private')
+            backend = ctl.Backend()
+            site = root / 'www/conf.d/sub.conf'
+            site.parent.mkdir(parents=True)
+            site.write_text('server {}\n')
+            backend.configure_subscription(c)
+            with patch.object(ctl, 'AGENT', agent):
+                backend.publish_subscription(c)
+                published = ctl.subscription_root(c) / 'subscribe'
+                self.assertEqual([p.name for p in (published / 'default').iterdir()], [digest])
+                old = published.resolve()
+                (default / digest).unlink()
+                backend.publish_subscription(c)
+                self.assertFalse((published / 'default' / digest).exists())
+                self.assertFalse(old.exists())
+            config = (root / 'www/conf.d/v2ray-agent-subscription.conf').read_text()
+            self.assertIn('server_name subscription.example.test;', config)
+            self.assertIn('/www/sites/sub/ssl/fullchain.pem', config)
+
     def test_normalize_preserves_users_ports_and_protocols(self):
         with tempfile.TemporaryDirectory() as t:
             root = Path(t)

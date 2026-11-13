@@ -6,8 +6,8 @@ export LANG=en_US.UTF-8
 
 # The standalone path does not load or download any 1Panel components.
 webBackend=standalone
-onepanelBackendSHA256='1076b97a9380c1ec59bfd669bb24848d14d5b92f5f5cc675efca70a320d805dd'
-onepanelControllerSHA256='0daf563fc7a6272adacb996f0cd575aad60db44b980a6cac6fee046feb2b4ba5'
+onepanelBackendSHA256='dd972537cce29fc4230979d87c02a7aa3ca38a69d52c8a110a117ff467ab63f7'
+onepanelControllerSHA256='8c92dc2d04d74f5e76d843f7c99e074502e2948d03431cee3fc28bb2f9f18eba'
 onepanelInstallerDirectory=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 onepanelInstallerFile="${onepanelInstallerDirectory}/$(basename -- "${BASH_SOURCE[0]}")"
 
@@ -1082,6 +1082,10 @@ allowPort() {
 }
 # 获取公网IP
 getPublicIP() {
+    if [[ "${webBackend:-}" == onepanel && "${onepanelSchema:-}" == 2 && -n "${onepanelDomain:-}" && -z "$1" ]]; then
+        printf '%s\n' "${onepanelDomain}"
+        return 0
+    fi
     local type=4
     if [[ -n "$1" ]]; then
         type=$1
@@ -3603,6 +3607,10 @@ initSingBoxClients() {
 
 # 初始化hysteria端口
 initHysteriaPort() {
+    if [[ "${webBackend:-}" == onepanel ]]; then
+        hysteriaPort=$(onepanelReadPort 6) && [[ -n "${hysteriaPort}" ]]
+        return $?
+    fi
     readSingBoxConfig
     if [[ -n "${hysteriaPort}" ]]; then
         read -r -p "读取到上次安装时的端口，是否使用上次安装时的端口？[y/n]:" historyHysteriaPortStatus
@@ -5054,7 +5062,7 @@ EOF
     fi
 
     if echo "${selectCustomInstallType}" | grep -q ",6,"; then
-        initHysteriaPort
+        initHysteriaPort || return 1
         initHysteria2Network
         saveXrayHysteria2Network || return 1
         cat <<EOF >/etc/v2ray-agent/xray/conf/06_hysteria2_inbounds.json
@@ -5947,18 +5955,22 @@ EOF
 
     elif [[ "${type}" == "vlessXHTTP" ]]; then
 
-        local xhttpMldsa65Param=
+        local xhttpMldsa65Param= xhttpHostParam=
         if [[ "${coreInstallType}" == "1" && -n "${currentRealityMldsa65Verify}" && "${currentRealityMldsa65Verify}" != "null" ]]; then
             xhttpMldsa65Param="&pqv=${currentRealityMldsa65Verify}"
         fi
 
+        if [[ "${webBackend:-}" == onepanel && "${onepanelSchema:-}" == 2 ]]; then
+            path="/${path#/}"
+            xhttpHostParam="&host=${xrayVLESSRealityXHTTPServerName}"
+        fi
         echoContent yellow " ---> 通用格式(VLESS+reality+XHTTP)"
         echoContent green "    vless://${id}@${add}:${port}?encryption=none&security=reality${xhttpMldsa65Param}&type=xhttp&sni=${xrayVLESSRealityXHTTPServerName}&host=${xrayVLESSRealityXHTTPServerName}&fp=chrome&path=${path}&pbk=${currentRealityXHTTPPublicKey}&sid=6ba85179e30d4fc2#${email}\n"
 
         echoContent yellow " ---> 格式化明文(VLESS+reality+XHTTP)"
         echoContent green "协议类型:VLESS reality，地址:${add}，publicKey:${currentRealityXHTTPPublicKey}，shortId: 6ba85179e30d4fc2,serverNames：${xrayVLESSRealityXHTTPServerName}，端口:${port}，路径：${path}，SNI:${xrayVLESSRealityXHTTPServerName}，伪装域名:${xrayVLESSRealityXHTTPServerName}，用户ID:${id}，传输方式:xhttp，账户名:${email}\n"
         cat <<EOF >>"${outputRoot}/default/${user}" || return 1
-vless://${id}@${add}:${port}?encryption=none&security=reality${xhttpMldsa65Param}&type=xhttp&sni=${xrayVLESSRealityXHTTPServerName}&fp=chrome&path=${path}&pbk=${currentRealityXHTTPPublicKey}&sid=6ba85179e30d4fc2#${email}
+vless://${id}@${add}:${port}?encryption=none&security=reality${xhttpMldsa65Param}&type=xhttp&sni=${xrayVLESSRealityXHTTPServerName}${xhttpHostParam}&fp=chrome&path=${path}&pbk=${currentRealityXHTTPPublicKey}&sid=6ba85179e30d4fc2#${email}
 EOF
 
         cat <<EOF >>"${outputRoot}/clashMeta/${user}" || return 1
@@ -6333,6 +6345,10 @@ EOF
 # 获取Reality订阅端口
 getRealitySubscriptionPort() {
     local protocol=$1
+    if [[ "${webBackend:-}" == onepanel && "${onepanelSchema:-}" == 2 && "${protocol}" == vision ]]; then
+        onepanelReadPort 7
+        return $?
+    fi
     if [[ "${coreInstallType}" == "2" ]]; then
         if [[ "${protocol}" == "grpc" ]]; then
             printf '%s\n' "${singBoxVLESSRealityGRPCPort}"
@@ -11829,7 +11845,7 @@ viewSubscriptionByUser() {
         if [[ "${subscribeType}" == http ]]; then
             currentDomain="$(getPublicIP):${subscribePort}"
         else
-            currentDomain="${currentHost}:${subscribePort}"
+            currentDomain="${subscribeDomain:-${currentHost}}:${subscribePort}"
         fi
     elif [[ -n "${currentDefaultPort}" && "${currentDefaultPort}" != "443" ]]; then
         currentDomain="${currentHost}:${currentDefaultPort}"
@@ -12395,6 +12411,10 @@ initRandomSalt() {
 # 订阅
 subscribe() (
     umask 022
+    if [[ "${webBackend:-}" == onepanel && "${onepanelSchema:-}" == 2 ]]; then
+        exec 9>/etc/v2ray-agent/onepanel-subscribe.lock || return 1
+        flock 9 || return 1
+    fi
     readInstallProtocolType
     if [[ "${currentInstallProtocolType}" == ",20," ]]; then
         echoContent yellow " ---> 仅安装 SOCKS5 入站，请通过 Socks5 入站菜单管理配置"
@@ -12497,7 +12517,7 @@ subscribe() (
                     if [[ "${subscribeType}" == "http" ]]; then
                         currentDomain="$(getPublicIP):${subscribePort}"
                     else
-                        currentDomain="${currentHost}:${subscribePort}"
+                        currentDomain="${subscribeDomain:-${currentHost}}:${subscribePort}"
                     fi
                 fi
                 if [[ -f "/etc/v2ray-agent/subscribe_local/clashMeta/${email}" ]]; then
@@ -12547,6 +12567,7 @@ subscribe() (
         fi
         mv -f "${subscribePublishPath}" "${publishedDir}" || return 1
         mv -f "${saltTemp}" "${saltPath}" || return 1
+        if [[ "${webBackend:-}" == onepanel ]]; then onepanelController publish || return 1; fi
         publishStarted=false
     else
         echoContent red " ---> 未安装伪装站点，无法使用订阅服务"

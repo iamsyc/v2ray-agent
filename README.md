@@ -2,28 +2,28 @@
 
 本仓库是 [mack-a/v2ray-agent](https://github.com/mack-a/v2ray-agent) 的 1Panel 兼容分支。中文入口 `install.sh` 保留独立 Nginx 模式，并在选择 Xray-core 后提供 **1Panel OpenResty** 安装模式。英文入口和独立 sing-box 安装流程保持上游行为。
 
-上游功能补丁已同步至 `v3.5.41`（`b407b5e`），保留本 fork 的 1Panel 后端和原有测试。Xray 原生 Hysteria2 沿用独立模式；1Panel 模式的协议范围保持不变。
+上游功能补丁已同步至 `v3.5.41`（`b407b5e`）。两种安装模式均支持 Xray 原生 Hysteria2。
 
 ## 1Panel OpenResty 模式
 
-先在服务器安装并启动 **1Panel v2、其 OpenResty 应用**，创建网站和有效证书，并开启该证书的自动续期。OpenResty 须使用 host 网络并包含 `stream_ssl_preread` 模块。安装器会列出面板实际的网站与证书 ID，供选择；无须开启面板公网 API，也不需要提供 API Key。
+先在服务器安装并启动 **1Panel v2 和 OpenResty**，保持面板网站的默认 HTTPS 端口为 `443`。在 1Panel 中为代理域名建站、开启 HTTPS、绑定证书并启用自动续期。OpenResty 须使用 host 网络并包含 `stream_ssl_preread` 模块，系统须支持 nftables。安装器通过面板本机 Unix socket 读取网站和证书。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/iamsyc/v2ray-agent/master/install.sh -o /root/install.sh
 bash /root/install.sh
 ```
 
-选择“安装”或“任意组合安装” → “Xray-core” → “1Panel OpenResty”。默认组合为 `0,7,12,14`；同时支持上游的 VLESS/VMess WebSocket 和 Trojan 组合。每次端口提示均注明对应协议。手动端口允许 `1–65535`，各节点端口必须互不重复，不能占用网站内部端口和协议内部保留端口。
+选择“安装”或“任意组合安装” → “Xray-core” → “1Panel OpenResty”。默认组合为 `0,6,7,12,14`，也可选 VLESS/VMess WebSocket 和 Trojan。默认端口为 TLS Vision TCP `777`、Hysteria2 UDP `8443`、REALITY Vision TCP `443`、REALITY XHTTP TCP `555`、XHTTP TLS TCP `666`。安装时逐项可改，端口冲突按 TCP 和 UDP 分别检查。Hysteria2 需要支持原生 Hysteria2 的 Xray-core，UDP `443` 留给网站 HTTP/3。
 
-安装前会明确提示：OpenResty 接管公网 TCP 443，关闭面板内置默认 HTTPS 占位页，面板现有 HTTPS 网站统一使用内部端口（默认 888），Xray 中使用 443 的入口只绑定 `127.0.0.1`。浏览器访问代理域名仍显示该域名的伪装站，HTTP 跳转使用标准 HTTPS 地址，不带内部端口。使用了 HTTP/3、显式 SSL 域名端口 443 或未登记到面板的 443 配置时，需要先在面板处理，安装器不会覆盖这些配置。
+公网 TCP `443` 经独立的 nftables 表送到 OpenResty 的 SNI 分流入口。网站 HTTPS 仍由 1Panel 在 `443` 管理。REALITY Vision 选择 `443` 时，匹配的域名进入 Xray，普通浏览器握手回落到本机网站。分流匹配本机地址，服务器地址变化后无需重新写入 IP。分流保留真实访问来源地址。
 
-网站、站点配置、TCP 配置及证书均沿用面板的实际目录，不假设面板一定安装在 `/opt/1panel`。REALITY 回落目标使用本机网站端口，避免绕回公网入口。订阅目录通过只读父目录挂载提供给 OpenResty，兼容上游原子替换订阅目录的发布方式；HTTP 仅暴露订阅格式和摘要文件名的白名单。
+订阅默认使用代理站点的域名和 TCP `888`。也可选择另一个已启用 HTTPS 的 1Panel 站点作为订阅域名，端口可单独设定。订阅配置、网站和证书路径从面板实际部署读取。OpenResty 仅读取发布的订阅文件，URL 按格式和摘要文件名匹配。
 
 **证书由 1Panel 续期**。证书目录发生变化后，安装器配置的 systemd 任务校验证书域名、有效期和私钥配对，部署到 Xray 的固定路径，并核对 OpenResty 实际提供的证书。证书不变时不会重复重启 Xray；部署失败会保留原 Xray 证书，五分钟后重试。新证书载入需要重启 Xray，现有代理连接会短暂中断。原 vasma 的 ACME 续期任务会移除。
 
-用户与订阅管理继续使用 `vasma`。重新安装会沿用所选模式；需要改变节点端口时再次运行安装流程。1Panel 模式只管理 Xray，sing-box/Hysteria2/TUIC 请使用原独立模式。如已配置绑定入站或用户的 SOCKS5 分流规则，重新安装或切换核心前需先解除这些绑定。核心版本与 Web 模式独立选择，重新安装默认保留现有核心版本；旧客户端可自行选择兼容发行版，例如 `v26.3.27`。本模式不会消除新旧 REALITY 客户端的握手差异。
+用户和订阅继续使用 `vasma` 管理。安装参数记录在 `/etc/v2ray-agent/onepanel.json`。有原生 Hysteria2 入站时，账号增删也覆盖该协议。独立 sing-box 和 TUIC 继续走独立模式。核心版本和 Web 模式独立选择，旧版核心可以安装其支持的协议组合。
 
-此分支没有迁移平台或额外的升级、回滚管理器。脚本自身更新从本 fork 获取，后端模块按内嵌 SHA-256 校验后加载。公网 IPv4 地址发生变化后需重新安装以更新 TCP 监听地址。卸载代理时保留面板网站、证书及网站的 443 转发入口。
+共享 443 布局用于新装。已有旧版 1Panel 布局继续按其原状态运行。脚本自身更新从本 fork 获取，后端模块按内嵌 SHA-256 校验。卸载共享 443 模式会移除代理分流和订阅，保留面板网站及证书。
 
 ### 开发验证
 
@@ -36,7 +36,7 @@ python3 -m unittest discover -s checks -p 'test_onepanel_backend.py' -v
 
 修改 `onepanel/` 后运行 `python3 tools/update_onepanel_manifest.py` 更新加载器摘要。`checks/onepanel_e2e.py` 只能在明确标记的临时测试机中运行，会安装真实面板应用、创建测试网站和测试证书；其合成证书用于验证部署事件，不验证真实公网 CA 或 DNS 账号。不要在生产服务器运行该测试脚本。
 
-集成验证环境为 Ubuntu 24.04 ARM64、1Panel v2.4.2、OpenResty 1.27.1.2 和 Xray v26.3.27。测试覆盖真实安装、七种订阅节点的实际传输、五种订阅格式、菜单增删用户、面板证书替换后的自动部署，其他面板 HTTPS 网站共存，以及卸载代理后保留网站和证书。公有 CA 签发与真实 DNS 账号续期不在合成证书测试范围内。
+集成验证环境为 Ubuntu 24.04 ARM64、1Panel v2.4.2、OpenResty 1.27.1.2 和 Xray v26.11.9。测试覆盖实际安装、五种默认协议的实际传输、五种订阅格式、独立订阅域名和端口、菜单增删用户、面板证书替换后的自动部署、新建面板 HTTPS 网站，以及卸载代理后保留网站和证书。公有 CA 签发与真实 DNS 账号续期不在合成证书测试范围内。
 
 - [感谢 JetBrains 提供的非商业开源软件开发授权](https://www.jetbrains.com/?from=v2ray-agent)
 

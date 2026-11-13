@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import socket
 import ssl
 import subprocess
@@ -26,6 +27,11 @@ SOCKET = '/etc/1panel/agent.sock'
 FORMATS = 'clashMeta|default|clashMetaProfiles|sing-box|sing-box_profiles'
 SAFE_NAME = re.compile(r'^[A-Za-z0-9_][A-Za-z0-9_.-]*$')
 INTERNAL_PORTS = {31296, 31297, 31299, 31300, 31302, 45987, 45988}
+STREAM_PORT = 10443
+REALITY_GATE_PORT = 10444
+ENTRY_UNIT = 'v2ray-agent-onepanel-entry.service'
+ENTRY_TABLE = 'v2ray_agent_443'
+ENTRY_RULES = AGENT / 'onepanel/shared443.nft'
 DOMAIN = re.compile(r'^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9-]{2,63}$')
 
 
@@ -92,7 +98,7 @@ def items(value):
 
 
 def validate_state(c):
-    if c.get('schema') != 1 or c.get('backend') != 'onepanel':
+    if c.get('schema') not in (1, 2) or c.get('backend') != 'onepanel':
         raise ValueError('Unsupported 1Panel installation state')
     for key in ('alias', 'container'):
         if not SAFE_NAME.fullmatch(c[key]) or c[key] in ('.', '..'):
@@ -102,8 +108,21 @@ def validate_state(c):
     for key in ('website_id', 'ssl_id', 'app_id'):
         if type(c[key]) is not int or c[key] < 1:
             raise ValueError(f'Invalid {key}')
-    if type(c['web_port']) is not int or not 1 <= c['web_port'] <= 65535 or c['web_port'] in {80, 443} | INTERNAL_PORTS:
-        raise ValueError('Website port is invalid or reserved by an internal listener')
+    if c['schema'] == 1:
+        if type(c['web_port']) is not int or not 1 <= c['web_port'] <= 65535 or c['web_port'] in {80, 443} | INTERNAL_PORTS:
+            raise ValueError('Website port is invalid or reserved by an internal listener')
+    else:
+        if c['web_port'] != 443:
+            raise ValueError('The 1Panel default HTTPS port must be 443')
+        if not DOMAIN.fullmatch(c['subscription_domain']):
+            raise ValueError('Select a registered DNS hostname for the subscription')
+        if not SAFE_NAME.fullmatch(c['subscription_alias']) or c['subscription_alias'] in ('.', '..'):
+            raise ValueError('Invalid subscription website alias')
+        if type(c['subscription_website_id']) is not int or c['subscription_website_id'] < 1:
+            raise ValueError('Invalid subscription website ID')
+        p = c['subscription_port']
+        if type(p) is not int or not 1 <= p <= 65535 or p in {80, STREAM_PORT, REALITY_GATE_PORT} | INTERNAL_PORTS:
+            raise ValueError('Subscription HTTPS port is invalid or reserved')
     address = ipaddress.ip_address(c['listen_ipv4'])
     if address.version != 4 or address.is_loopback or address.is_unspecified or address.is_multicast:
         raise ValueError('Public listener must use an assigned non-loopback IPv4 address')
@@ -111,11 +130,23 @@ def validate_state(c):
         p = Path(c[key])
         if not p.is_absolute() or '..' in p.parts or any(x in str(p) for x in '\n\r;{}"$'):
             raise ValueError(f'Invalid {key}')
-    if c['web_port'] in c.get('ports', {}).values():
-        raise ValueError('A proxy node port collides with the website port')
-    values = list(c.get('ports', {}).values())
-    if len(values) != len(set(values)) or any(type(p) is not int or not 1 <= p <= 65535 or p == 80 for p in values):
+    ports = c.get('ports', {})
+    values = [p for k, p in ports.items() if k != '6']
+    if any(type(p) is not int or not 1 <= p <= 65535 for p in ports.values()):
+        raise ValueError('Node ports must be valid integers')
+    if len(values) != len(set(values)) or 80 in values:
         raise ValueError('Node ports must be distinct valid TCP ports, excluding website HTTP 80')
+    if c['schema'] == 1 and c['web_port'] in values:
+        raise ValueError('A proxy node port collides with the website port')
+    if c['schema'] == 2:
+        if any(p == 443 and k != '7' for k, p in ports.items() if k != '6'):
+            raise ValueError('Only REALITY Vision can share the website TCP 443 listener')
+        if c['subscription_port'] != 443 and c['subscription_port'] in values:
+            raise ValueError('A proxy node port collides with the subscription TCP port')
+        if set(values) & {STREAM_PORT, REALITY_GATE_PORT}:
+            raise ValueError('Node port is reserved by the shared HTTPS entry')
+        if ports.get('6') == 443:
+            raise ValueError('UDP 443 is reserved for 1Panel HTTP/3')
     if set(values) & INTERNAL_PORTS:
         raise ValueError('Node port is reserved by an internal protocol/fallback listener')
     return c
@@ -129,6 +160,14 @@ def site_path(c):
     return Path(c['website_root']) / 'sites' / c['alias']
 
 
+def subscription_site_path(c):
+    return Path(c['website_root']) / 'sites' / c['subscription_alias']
+
+
+def subscription_root(c):
+    return Path(c['website_root']) / 'v2ray-agent'
+
+
 def site_config(c):
     return Path(c['website_root']) / 'conf.d' / (c['alias'] + '.conf')
 
@@ -138,6 +177,24 @@ def container_path(c, path):
 
 
 def stream_config(c, front):
+    if c['schema'] == 2:
+        ipv6 = f'\n    listen [::]:{STREAM_PORT};' if c.get('ipv6') else ''
+        match = f'    {c["domain"]} 127.0.0.1:{REALITY_GATE_PORT};\n' if front else ''
+        return f'''# Managed by v2ray-agent 1Panel backend.
+map $ssl_preread_server_name $v2ray_agent_backend {{
+{match}    default 127.0.0.1:443;
+}}
+server {{
+    listen {STREAM_PORT};{ipv6}
+    ssl_preread on;
+    proxy_protocol on;
+    proxy_pass $v2ray_agent_backend;
+    proxy_connect_timeout 5s;
+    proxy_timeout 24h;
+    proxy_socket_keepalive on;
+    proxy_half_close on;
+}}
+'''
     ipaddress.ip_address(c['listen_ipv4'])
     upstream = '127.0.0.1:443' if front else f'127.0.0.1:{c["web_port"]}'
     ipv6 = '\n    listen [::]:443 ipv6only=on;' if c.get('ipv6') else ''
@@ -158,17 +215,17 @@ server {{
 '''
 
 
-def subscription_location():
+def subscription_location(root='/srv/v2ray-agent/subscribe'):
     return f'''location ~ "^/s/({FORMATS})/([a-f0-9]{{32}})$" {{
     default_type 'text/plain; charset=utf-8';
-    alias /srv/v2ray-agent/subscribe/$1/$2;
+    alias {root}/$1/$2;
 }}
 '''
 
 
 def fallback_config(c):
     root = container_path(c, site_path(c) / 'index')
-    location = subscription_location()
+    location = subscription_location() if c['schema'] == 1 else ''
     return f'''# Managed by v2ray-agent 1Panel backend; TLS/Vision fallback.
 server {{
     listen 127.0.0.1:31300 proxy_protocol;
@@ -186,6 +243,44 @@ server {{
     real_ip_header proxy_protocol;
     root {root};
     {location}
+}}
+'''
+
+
+def shared_http_config(c):
+    ipv6 = '\n    listen [::]:443 ssl proxy_protocol;' if c.get('ipv6') else ''
+    cert = container_path(c, site_path(c) / 'ssl')
+    return f'''# Managed by v2ray-agent 1Panel backend.
+set_real_ip_from 127.0.0.1;
+set_real_ip_from ::1;
+real_ip_header proxy_protocol;
+server {{
+    listen 443 ssl proxy_protocol;{ipv6}
+    server_name "";
+    ssl_certificate {cert}/fullchain.pem;
+    ssl_certificate_key {cert}/privkey.pem;
+    return 444;
+}}
+'''
+
+
+def shared_entry_rules(ipv6):
+    prerouting6 = f'\n        iifname != "lo" meta nfproto ipv6 tcp dport 443 fib daddr type local redirect to :{STREAM_PORT}' if ipv6 else ''
+    output6 = f'\n        ip6 daddr != ::1 tcp dport 443 fib daddr type local redirect to :{STREAM_PORT}' if ipv6 else ''
+    return f'''table inet {ENTRY_TABLE} {{
+    chain prerouting {{
+        type nat hook prerouting priority dstnat - 1; policy accept;
+        iifname != "lo" meta nfproto ipv4 tcp dport 443 fib daddr type local redirect to :{STREAM_PORT}{prerouting6}
+    }}
+    chain output {{
+        type nat hook output priority dstnat - 1; policy accept;
+        ip daddr != 127.0.0.0/8 tcp dport 443 fib daddr type local redirect to :{STREAM_PORT}{output6}
+    }}
+    chain input {{
+        type filter hook input priority filter - 1; policy accept;
+        iifname != "lo" tcp dport {STREAM_PORT} ct status dnat ct original proto-dst 443 accept
+        iifname != "lo" tcp dport {STREAM_PORT} drop
+    }}
 }}
 '''
 
@@ -259,17 +354,28 @@ class Backend:
                 'cpu_quota': d['HostConfig'].get('NanoCpus', 0) / 1e9,
                 'memory_mb': d['HostConfig'].get('Memory', 0) / 1048576,
                 'restart_policy': d['HostConfig'].get('RestartPolicy', {}).get('Name') or 'unless-stopped',
+                'web_port': matches[0].get('httpsPort', 443),
                 'listen_ipv4': assigned_ipv4(),
                 'ipv6': Path('/proc/sys/net/ipv6/conf/all/disable_ipv6').read_text().strip() == '0',
                 'running': d['State']['Running']}
 
-    def select(self, website_id, ssl_id, web_port):
+    def select(self, website_id, ssl_id, subscription_port, subscription_website_id, ports):
         c = self.inventory()
         w = self.panel.call(f'websites/{website_id}')
         cert = self.panel.call(f'websites/ssl/{ssl_id}')
-        c.update(schema=1, backend='onepanel', website_id=website_id, ssl_id=ssl_id,
-                 alias=w['alias'], domain=w['primaryDomain'], web_port=web_port, ports={})
+        subscription_website_id = subscription_website_id or website_id
+        sub = w if subscription_website_id == website_id else self.panel.call(f'websites/{subscription_website_id}')
+        c.update(schema=2, backend='onepanel', website_id=website_id, ssl_id=ssl_id,
+                 alias=w['alias'], domain=w['primaryDomain'], ports={}, subscription_port=subscription_port,
+                 subscription_website_id=subscription_website_id, subscription_alias=sub['alias'],
+                 subscription_domain=sub['primaryDomain'])
         validate_state(c)
+        if STATE.exists():
+            previous = load()
+            if previous['schema'] == 1:
+                raise ValueError('Existing 1Panel installation uses the legacy layout; use a fresh installation for shared HTTPS 443')
+            if previous['subscription_website_id'] != subscription_website_id and previous['subscription_port'] == 443:
+                raise ValueError('Detach the current subscription website before selecting another website')
         if not cert.get('autoRenew') or cert.get('status') != 'ready':
             raise ValueError('Select a ready 1Panel certificate with automatic renewal enabled')
         if cert.get('provider') not in ('dnsAccount', 'http'):
@@ -277,15 +383,16 @@ class Backend:
         check_certificate(cert['pem'].encode(), cert['privateKey'].encode(), c['domain'])
         if not site_config(c).is_file():
             raise ValueError('The selected website has no generated OpenResty configuration')
-        if STATE.exists():
-            previous = load()
-            if previous['website_id'] == website_id and previous['domain'] == c['domain']:
-                c['ports'] = previous.get('ports', {})
-        write(STATE, json.dumps(c, indent=2) + '\n')
-        return c
+        if subscription_website_id != website_id:
+            https = self.panel.call(f'websites/{subscription_website_id}/https')
+            if not sub.get('webSiteSSLId') or not https.get('enable'):
+                raise ValueError('Enable HTTPS on the subscription website in 1Panel first')
+            material = subscription_site_path(c) / 'ssl'
+            check_certificate((material / 'fullchain.pem').read_bytes(), (material / 'privkey.pem').read_bytes(), c['subscription_domain'])
+        return self.set_ports(c, ports)
 
     def set_ports(self, c, ports):
-        if not isinstance(ports, dict) or any(k not in ('0', '7', '12', '14') for k in ports):
+        if not isinstance(ports, dict) or any(k not in ('0', '6', '7', '12', '14') for k in ports):
             raise ValueError('Invalid protocol-port selection')
         c = dict(c, ports=ports)
         validate_state(c)
@@ -305,21 +412,32 @@ class Backend:
                 procs = Path('/sys/fs/cgroup') / group.lstrip('/') / 'cgroup.procs'
                 if procs.exists():
                     legacy_pids = set(procs.read_text().split())
-        allowed = {port: own_pids for port in ports.values()}
+        allowed = {port: own_pids for k, port in ports.items() if k != '6'}
         allowed[443] = own_pids | panel_pids | legacy_pids
-        allowed[c['web_port']] = panel_pids | legacy_pids
+        if c['schema'] == 1:
+            allowed[c['web_port']] = panel_pids | legacy_pids
+        else:
+            allowed[STREAM_PORT] = panel_pids if (Path(c['website_root']) / 'stream.d/v2ray-agent-443.conf').exists() else set()
+            allowed[REALITY_GATE_PORT] = own_pids
+            if c['subscription_port'] != 443:
+                installed = (Path(c['website_root']) / 'conf.d/v2ray-agent-subscription.conf').exists()
+                allowed[c['subscription_port']] = panel_pids if installed else set()
         internal = INTERNAL_PORTS
         for port in internal:
             allowed[port] = own_pids | legacy_pids
             if (Path(c['website_root']) / 'conf.d/v2ray-agent-fallback.conf').exists() and port in (31300, 31302):
                 allowed[port] |= panel_pids
-        for port, permitted in allowed.items():
-            listeners = run('ss', '-H', '-lntp', f'sport = :{port}')
+        checks = [(port, permitted, 'tcp', '-lntp') for port, permitted in allowed.items()]
+        if '6' in ports:
+            checks.append((ports['6'], own_pids, 'udp', '-lnup'))
+        for port, permitted, protocol, options in checks:
+            listeners = run('ss', '-H', options, f'sport = :{port}')
             for line in listeners.splitlines():
                 pids = re.findall(r'pid=(\d+)', line)
                 if not pids or not set(pids).issubset(permitted):
-                    raise ValueError(f'TCP port {port} is occupied by another service')
+                    raise ValueError(f'{protocol.upper()} port {port} is occupied by another service')
         write(STATE, json.dumps(c, indent=2) + '\n')
+        return c
 
     def reload(self, c):
         run('docker', 'exec', c['container'], 'openresty', '-t')
@@ -335,7 +453,10 @@ class Backend:
         self.panel.call(f'websites/{website_id}/https', body)
 
     def prepare(self, c):
-        """Normalize the panel's actual HTTPS default before creating the TCP front."""
+        """Configure the OpenResty entry using the layout recorded at installation."""
+        if c['schema'] == 2:
+            self.prepare_shared(c)
+            return
         cohort = []
         for w in self.websites():
             if w.get('protocol', '').lower() == 'https' or w['id'] == c['website_id']:
@@ -452,7 +573,70 @@ class Backend:
         self.configure_stream(c, front=False)
         self.reload(c)
 
+    def prepare_shared(self, c):
+        if not c['running']:
+            raise ValueError('Start the 1Panel OpenResty app before installing')
+        current = self.panel.call(f'websites/{c["website_id"]}/https')
+        site = self.panel.call(f'websites/{c["website_id"]}')
+        if not current.get('enable') or site.get('webSiteSSLId') != c['ssl_id']:
+            raise ValueError('Enable HTTPS and bind the selected certificate to the proxy website in 1Panel first')
+        if not re.search(r'\blisten\s+(?:\[::\]:)?443\s+[^;]*\bssl\b', site_config(c).read_text()):
+            raise ValueError('The proxy website must have a TLS listener on 443')
+        if subprocess.run(['systemctl', 'is-active', '--quiet', 'nginx']).returncode == 0:
+            raise ValueError('Stop standalone Nginx before installing the 1Panel mode')
+
+        root = Path(c['website_root'])
+        paths = [root / 'conf.d' / f'v2ray-agent-{name}.conf' for name in ('shared443', 'subscription', 'fallback')]
+        paths += [root / 'stream.d/v2ray-agent-443.conf']
+        paths.append(root / 'conf.d' / (c['subscription_alias'] + '.conf'))
+        paths.append(subscription_root(c) / 'subscription-location.conf')
+        old = {p: p.read_bytes() if p.exists() else None for p in paths}
+        try:
+            write(paths[0], shared_http_config(c), 0o644)
+            self.configure_site(c)
+            self.configure_stream(c, front=False)
+            self.reload(c)
+            self.install_entry(c)
+        except Exception:
+            for p, contents in old.items():
+                write(p, contents, 0o644) if contents is not None else p.unlink(missing_ok=True)
+            self.reload(c)
+            raise
+
+    def install_entry(self, c):
+        nft = shutil.which('nft')
+        if not nft:
+            raise ValueError('nftables is required for the shared TCP 443 entry')
+        exists = subprocess.run([nft, 'list', 'table', 'inet', ENTRY_TABLE], capture_output=True).returncode == 0
+        prefix = f'delete table inet {ENTRY_TABLE}\n' if exists else ''
+        rules = shared_entry_rules(c['ipv6'])
+        run(nft, '-c', '-f', '-', data=(prefix + rules).encode())
+        if exists and subprocess.run(['systemctl', 'is-active', '--quiet', ENTRY_UNIT]).returncode != 0:
+            raise ValueError(f'An unmanaged nftables table {ENTRY_TABLE} already exists')
+        # "add table" is idempotent, making the delete-and-recreate batch safe at boot and reload.
+        write(ENTRY_RULES, f'add table inet {ENTRY_TABLE}\ndelete table inet {ENTRY_TABLE}\n' + rules)
+        write(Path('/etc/systemd/system') / ENTRY_UNIT, f'''[Unit]
+Description=Redirect local TCP 443 into the 1Panel OpenResty stream listener
+After=network.target nftables.service netfilter-persistent.service ufw.service firewalld.service
+Before=docker.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart={nft} -f {ENTRY_RULES}
+ExecReload={nft} -f {ENTRY_RULES}
+ExecStop=-{nft} delete table inet {ENTRY_TABLE}
+[Install]
+WantedBy=multi-user.target
+''', 0o644)
+        run('systemctl', 'daemon-reload')
+        run('systemctl', 'enable', ENTRY_UNIT)
+        run('systemctl', 'reload-or-restart', ENTRY_UNIT)
+
     def configure_site(self, c):
+        if c['schema'] == 2:
+            self.configure_subscription(c)
+            write(Path(c['website_root']) / 'conf.d/v2ray-agent-fallback.conf', fallback_config(c), 0o644)
+            return
         include = site_path(c) / 'v2ray-agent-subscription.conf'
         write(include, subscription_location(), 0o644)
         p = site_config(c)
@@ -463,31 +647,147 @@ class Backend:
             self.panel.call('websites/nginx/update', {'id': c['website_id'], 'content': text})
         write(Path(c['website_root']) / 'conf.d' / 'v2ray-agent-fallback.conf', fallback_config(c), 0o644)
 
+    def configure_subscription(self, c):
+        root = subscription_root(c)
+        if not root.exists():
+            root.mkdir()
+            root.chmod(0o755)
+        location = subscription_location(container_path(c, root / 'subscribe'))
+        generated = Path(c['website_root']) / 'conf.d/v2ray-agent-subscription.conf'
+        include = root / 'subscription-location.conf'
+        p = Path(c['website_root']) / 'conf.d' / (c['subscription_alias'] + '.conf')
+        directive = 'include ' + container_path(c, include) + ';'
+        text = p.read_text()
+        if c['subscription_port'] == 443:
+            generated.unlink(missing_ok=True)
+            write(include, location, 0o644)
+            if directive not in text:
+                self.panel.call('websites/nginx/update', {'id': c['subscription_website_id'],
+                                'content': text.replace('server {', 'server {\n    ' + directive, 1)})
+            return
+        if directive in text:
+            self.panel.call('websites/nginx/update', {'id': c['subscription_website_id'],
+                            'content': '\n'.join(line for line in text.splitlines() if line.strip() != directive) + '\n'})
+            include.unlink(missing_ok=True)
+        port = c['subscription_port']
+        ipv6 = f'\n    listen [::]:{port} ssl;' if c.get('ipv6') else ''
+        material = container_path(c, subscription_site_path(c) / 'ssl')
+        write(generated, f'''# Managed by v2ray-agent 1Panel backend.
+server {{
+    listen {port} ssl;{ipv6}
+    server_name {c['subscription_domain']};
+    ssl_certificate {material}/fullchain.pem;
+    ssl_certificate_key {material}/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    {location}
+    location / {{ return 404; }}
+}}
+''', 0o644)
+
+    def publish_subscription(self, c):
+        if c['schema'] == 1:
+            return
+        root = subscription_root(c)
+        with (root / '.publish.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            current = root / 'subscribe'
+            old = os.readlink(current) if current.is_symlink() else ''
+            snapshot = Path(tempfile.mkdtemp(prefix='.subscriptions.', dir=root))
+            try:
+                snapshot.chmod(0o755)
+                for fmt in FORMATS.split('|'):
+                    target = snapshot / fmt
+                    target.mkdir(mode=0o755)
+                    target.chmod(0o755)
+                    for p in (AGENT / 'subscribe' / fmt).iterdir():
+                        if re.fullmatch(r'[a-f0-9]{32}', p.name) and p.is_file() and not p.is_symlink():
+                            write(target / p.name, p.read_bytes(), 0o644)
+                link = snapshot / '.link'
+                link.symlink_to(snapshot.name)
+                os.replace(link, current)
+            except Exception:
+                shutil.rmtree(snapshot)
+                raise
+            if re.fullmatch(r'\.subscriptions\.[A-Za-z0-9_]+', old):
+                shutil.rmtree(root / old)
+
     def configure_stream(self, c, front):
         write(Path(c['website_root']) / 'stream.d' / 'v2ray-agent-443.conf', stream_config(c, front), 0o644)
 
     def normalize_xray(self, c):
         front = False
-        for path in (AGENT / 'xray/conf').glob('*.json'):
+        conf = AGENT / 'xray/conf'
+        shared = c['schema'] == 2
+        name = 'v2ray-agent-onepanel-reality'
+        gate_file = '07_VLESS_vision_reality_inbounds.json'
+        gate_rule = {'type': 'field', 'inboundTag': ['dokodemo-in-VLESSReality'], 'outboundTag': name}
+        if shared:
+            direct = conf / 'z_direct_outbound.json'
+            egress = json.loads(direct.read_text())
+            egress['outbounds'] = [out for out in egress['outbounds'] if out.get('tag') != name]
+            for out in egress['outbounds']:
+                settings = out.get('settings', {})
+                if out.get('protocol') == 'freedom' and 'domainStrategy' in settings:
+                    out.setdefault('streamSettings', {}).setdefault('sockopt', {})['domainStrategy'] = settings.pop('domainStrategy')
+        for path in conf.glob('*.json'):
             data = json.loads(path.read_text())
             changed = False
             for i in data.get('inbounds', []):
-                if i.get('port') == 443:
+                if shared and i.get('protocol') == 'hysteria' and not c.get('ipv6') and i.get('listen') == '::':
+                    i['listen'] = '0.0.0.0'
+                    changed = True
+                if (not shared and i.get('port') == 443) or (
+                        shared and i.get('tag') == 'dokodemo-in-VLESSReality' and c['ports'].get('7') == 443):
                     i['listen'] = '127.0.0.1'
                     front = True
                     changed = True
+                    if shared:
+                        i['port'] = REALITY_GATE_PORT
+                        i.pop('sniffing', None)
+                        i.setdefault('streamSettings', {}).setdefault('sockopt', {})['acceptProxyProtocol'] = True
                 st = i.get('streamSettings', {})
                 if st.get('security') == 'reality':
                     st['realitySettings']['target'] = f'127.0.0.1:{c["web_port"]}'
+                    if shared:
+                        st['realitySettings']['xver'] = 1
                     changed = True
             # The upstream Reality gate used a tag that did not match its inbound.
-            if path.name == '07_VLESS_vision_reality_inbounds.json':
+            if path.name == gate_file:
                 for rule in data.get('routing', {}).get('rules', []):
                     if rule.get('inboundTag') == ['dokodemo-in']:
                         rule['inboundTag'] = ['dokodemo-in-VLESSReality']
                         changed = True
+                if shared and front:
+                    inner = data['inbounds'][1]
+                    inner['streamSettings'].setdefault('sockopt', {})['acceptProxyProtocol'] = True
+                    # Xray replaces the routing section when reading a later fragment.
+                    data.pop('routing', None)
+                    # Keep the generic direct outbound first in the final merged config.
+                    egress['outbounds'].append({'tag': name, 'protocol': 'freedom', 'settings': {
+                        'redirect': f'127.0.0.1:{inner["port"]}', 'proxyProtocol': 1}})
+                    changed = True
             if changed:
                 write(path, json.dumps(data, indent=2) + '\n')
+        if shared:
+            routing_file = conf / '09_routing.json'
+            routing = json.loads(routing_file.read_text())
+            rules = routing['routing']['rules']
+            rules[:] = [rule for rule in rules if rule.get('outboundTag') != name]
+            if front:
+                rules.insert(0, gate_rule)
+            # Merge the XHTTP TLS tunnel rule here too so it cannot replace the shared rules.
+            xhttp = conf / '14_VLESS_XHTTP_TLS_inbounds.json'
+            if xhttp.exists():
+                config = json.loads(xhttp.read_text())
+                if 'routing' in config:
+                    for rule in config.pop('routing').get('rules', []):
+                        if rule not in rules:
+                            rules.append(rule)
+                    write(xhttp, json.dumps(config, indent=2) + '\n')
+            else:
+                rules[:] = [rule for rule in rules if rule.get('inboundTag') != ['dokodemo-in-VLESSXHTTPTLS']]
+            write(routing_file, json.dumps(routing, indent=2) + '\n')
+            write(direct, json.dumps(egress, indent=2) + '\n')
         run(AGENT / 'xray/xray', 'run', '-test', '-confdir', AGENT / 'xray/conf')
         self.configure_stream(c, front)
         self.reload(c)
@@ -513,6 +813,8 @@ class Backend:
                     context.verify_mode = ssl.CERT_NONE
                     # Trust the exact authenticated-panel leaf, not an arbitrary self-signed peer.
                     with socket.create_connection(('127.0.0.1', c['web_port']), timeout=3) as conn:
+                        if c['schema'] == 2:
+                            conn.sendall(b'PROXY UNKNOWN\r\n')
                         with context.wrap_socket(conn, server_hostname=c['domain']) as tls:
                             return tls.getpeercert(binary_form=True) == leaf
                 except (OSError, ssl.SSLError):
@@ -590,6 +892,9 @@ WantedBy=timers.target
         for suffix in ('path', 'timer', 'service'):
             Path('/etc/systemd/system/v2ray-agent-onepanel-cert.' + suffix).unlink(missing_ok=True)
         run('systemctl', 'daemon-reload')
+        if c['schema'] == 2:
+            self.detach_shared(c)
+            return
         p = site_config(c)
         directive = 'include ' + container_path(c, site_path(c) / 'v2ray-agent-subscription.conf') + ';'
         text = '\n'.join(line for line in p.read_text().splitlines() if line.strip() != directive) + '\n'
@@ -599,14 +904,32 @@ WantedBy=timers.target
         self.configure_stream(c, front=False)
         self.reload(c)
 
+    def detach_shared(self, c):
+        root = Path(c['website_root'])
+        if c['subscription_port'] == 443:
+            p = root / 'conf.d' / (c['subscription_alias'] + '.conf')
+            directive = 'include ' + container_path(c, subscription_root(c) / 'subscription-location.conf') + ';'
+            text = '\n'.join(line for line in p.read_text().splitlines() if line.strip() != directive) + '\n'
+            self.panel.call('websites/nginx/update', {'id': c['subscription_website_id'], 'content': text})
+        for name in ('subscription', 'fallback', 'shared443'):
+            (root / 'conf.d' / f'v2ray-agent-{name}.conf').unlink(missing_ok=True)
+        (root / 'stream.d/v2ray-agent-443.conf').unlink(missing_ok=True)
+        run('systemctl', 'disable', '--now', ENTRY_UNIT)
+        self.reload(c)
+        (Path('/etc/systemd/system') / ENTRY_UNIT).unlink(missing_ok=True)
+        run('systemctl', 'daemon-reload')
+        if subscription_root(c).exists():
+            shutil.rmtree(subscription_root(c))
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['inventory', 'select', 'set-ports', 'prepare', 'normalize', 'seed-certificate', 'deploy', 'watch', 'reload', 'detach'])
+    parser.add_argument('command', choices=['inventory', 'select', 'set-ports', 'prepare', 'normalize', 'seed-certificate', 'deploy', 'watch', 'reload', 'publish', 'detach'])
     parser.add_argument('--website-id', type=int)
     parser.add_argument('--ssl-id', type=int)
-    parser.add_argument('--web-port', type=int, default=888)
-    parser.add_argument('--ports')
+    parser.add_argument('--subscription-website-id', type=int)
+    parser.add_argument('--subscription-port', type=int, default=888)
+    parser.add_argument('--ports', default='{}')
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error('Run as root on the 1Panel server')
@@ -624,7 +947,8 @@ def main():
     if args.command == 'select':
         if not args.website_id or not args.ssl_id:
             parser.error('--website-id and --ssl-id are required')
-        print(json.dumps(backend.select(args.website_id, args.ssl_id, args.web_port)))
+        print(json.dumps(backend.select(args.website_id, args.ssl_id, args.subscription_port,
+                                        args.subscription_website_id, json.loads(args.ports))))
         return
     c = load()
     if args.command == 'set-ports':
@@ -641,6 +965,8 @@ def main():
         backend.install_watcher(c)
     elif args.command == 'reload':
         backend.reload(c)
+    elif args.command == 'publish':
+        backend.publish_subscription(c)
     elif args.command == 'detach':
         backend.detach(c)
 
